@@ -1,0 +1,19 @@
+self-hosted-runner:
+  labels:
+    - em-ci
+    - trusted-pr
+    - workflow-nano
+    - ci-control
+    - ci-review
+    - rust-small
+    - rust-light
+    - rust-standard
+    - rust-heavy
+    - rust-large
+    - provider-hetzner
+    - provider-contabo
+    - cx23
+    - cx33
+    - cx43
+    - cx53
+    - vps20
