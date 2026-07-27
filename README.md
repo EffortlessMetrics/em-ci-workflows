@@ -23,10 +23,17 @@ Use `fetch_depth: 0` only when the proof script compares revisions, such as
 
 Profiles are capability contracts:
 
-- `light`: 3 CPU / 6 GiB
-- `standard`: 4 CPU / 9 GiB
-- `heavy`: 6 CPU / 12–13 GiB
-- `large`: exclusive 14 CPU / 28 GiB CX53 mode
+- `light`: full 4 guest vCPUs / 4 Cargo jobs / 6 GiB
+- `standard`: full 6 guest vCPUs / 6 Cargo jobs / 9 GiB on VPS20
+- `heavy`: CX43 full 8 guest vCPUs / 8 Cargo jobs / 13 GiB; CX53 normal sees all 16 guest vCPUs with 8 Cargo jobs / 12 GiB
+- `large`: exclusive CX53 with full 16 guest vCPUs / 16 Cargo jobs / 28 GiB
+
+CPU access is work-conserving. A slot's Docker ceiling equals the host's full
+guest-vCPU count; no profile pins CPU IDs or withholds whole guest CPUs for host
+overhead. Both CX53 normal slots use the full 16-vCPU ceiling and equal default
+CPU weight, so one active job can use idle capacity while two active jobs share
+the machine. Cargo jobs, memory, disk, inodes, PIDs, and simultaneous slot count
+remain independent boundaries.
 
 The workflow's small `ci-control` jobs execute only this full-SHA-pinned workflow
 source. They do not check out caller-controlled source or receive repository
