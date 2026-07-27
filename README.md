@@ -70,6 +70,15 @@ Rust CI / Required
 Do not require conditional implementation jobs.
 
 The internal source of truth remains `.github/workflows/rust.yml` in `em-ci`.
-`em-ci` validation requires this public workflow and actionlint configuration to
-remain byte-for-byte synchronized with that source. Changes are published from
-internal `em-ci`; this repository is not edited independently.
+`em-ci` validation requires this public workflow, actionlint configuration, and
+license files to remain byte-for-byte synchronized with that source. Changes are
+published from internal `em-ci`; this repository is not edited independently.
+
+## License
+
+The public workflow distribution is available under either of:
+
+- Apache License, Version 2.0 (`LICENSE-APACHE`)
+- MIT License (`LICENSE-MIT`)
+
+at your option.
