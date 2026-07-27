@@ -21,6 +21,13 @@ on:
 permissions:
   contents: read
 
+env:
+  # The reusable workflow and image move together. Keeping this explicit lets the
+  # currently activated image enforce the same version before the replacement
+  # image carrying the ENV marker is published and activated.
+  EM_CI_RUST_VERSION: "1.97.1"
+  RUSTUP_TOOLCHAIN: "1.97.1"
+
 jobs:
   classify:
     name: Classify trust and profile
@@ -124,6 +131,54 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: ${{ inputs.fetch_depth }}
+      - name: Verify Rust toolchain contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=$EM_CI_RUST_VERSION
+          [[ "$expected" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo '::error::the reusable workflow does not expose an exact EM CI Rust version'
+            exit 78
+          }
+          [[ "$RUSTUP_TOOLCHAIN" == "$expected" ]] || {
+            echo "::error::RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN, expected $expected"
+            exit 78
+          }
+          actual=$(rustc --version | awk '{print $2}')
+          [[ "$actual" == "$expected" ]] || {
+            echo "::error::runner resolved Rust $actual, expected $expected"
+            exit 78
+          }
+
+          requested=''
+          toolchain_file=''
+          if [[ -f rust-toolchain.toml ]]; then
+            toolchain_file=rust-toolchain.toml
+          elif [[ -f rust-toolchain ]]; then
+            toolchain_file=rust-toolchain
+          fi
+          if [[ -n "$toolchain_file" ]]; then
+            if grep -Eq '^[[:space:]]*\[' "$toolchain_file"; then
+              requested=$(python3 - "$toolchain_file" <<'PY'
+          import pathlib
+          import sys
+          import tomllib
+
+          path = pathlib.Path(sys.argv[1])
+          with path.open("rb") as stream:
+              data = tomllib.load(stream)
+          print(data.get("toolchain", {}).get("channel", ""))
+          PY
+              )
+            else
+              requested=$(tr -d '[:space:]' < "$toolchain_file")
+            fi
+          fi
+          if [[ -n "$requested" && "$requested" != "$expected" ]]; then
+            echo "::error::$toolchain_file requests Rust $requested, but EM CI is activated on $expected"
+            exit 78
+          fi
+          echo "Rust toolchain contract: $expected"
       - name: Record EM CI job context
         shell: bash
         env:
