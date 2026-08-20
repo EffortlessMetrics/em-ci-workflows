@@ -10,6 +10,10 @@ self-hosted-runner:
     - rust-standard
     - rust-heavy
     - rust-large
+    - python-light
+    - python-standard
+    - python-heavy
+    - python-large
     - provider-hetzner
     - provider-contabo
     - cx23
