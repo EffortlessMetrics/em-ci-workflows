@@ -1,0 +1,412 @@
+name: EM CI Python
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: light, standard, heavy, or large
+        required: true
+        type: string
+      python:
+        description: "Supported Python series: 3.11, 3.12, or 3.13"
+        required: true
+        type: string
+      lane:
+        description: Stable lowercase lane identity used for evidence names
+        required: true
+        type: string
+      script:
+        description: Repository-owned proof script
+        required: false
+        default: .ci/python.sh
+        type: string
+      fetch_depth:
+        description: Checkout depth; use 0 only when the proof compares Git history
+        required: false
+        default: 1
+        type: number
+      upload_artifacts:
+        description: Upload the bounded .ci/artifacts/<lane> proof directory
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  EM_CI_PYTHON_311_VERSION: "3.11.16"
+  EM_CI_PYTHON_312_VERSION: "3.12.14"
+  EM_CI_PYTHON_313_VERSION: "3.13.15"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  UV_MANAGED_PYTHON: "1"
+  UV_NO_PROGRESS: "1"
+
+jobs:
+  classify:
+    name: Classify trust and Python profile
+    runs-on:
+      group: em-ci-build
+      labels: [self-hosted, linux, x64, ci-control]
+    timeout-minutes: 5
+    outputs:
+      profile: ${{ steps.classify.outputs.profile }}
+      python: ${{ steps.classify.outputs.python }}
+      lane: ${{ steps.classify.outputs.lane }}
+      self_hosted: ${{ steps.classify.outputs.self_hosted }}
+      hosted_enabled: ${{ steps.classify.outputs.hosted_enabled }}
+      runner_image: ${{ steps.classify.outputs.runner_image }}
+    steps:
+      # This job executes only immutable reusable-workflow source. It never
+      # checks out caller-controlled code or consumes repository secrets.
+      - id: classify
+        shell: bash
+        env:
+          REQUESTED_PROFILE: ${{ inputs.profile }}
+          REQUESTED_PYTHON: ${{ inputs.python }}
+          REQUESTED_LANE: ${{ inputs.lane }}
+          REQUESTED_FETCH_DEPTH: ${{ inputs.fetch_depth }}
+          HOSTED_ENABLED: ${{ vars.EM_CI_GITHUB_HOSTED_ENABLED }}
+          RUNNER_IMAGE: ${{ vars.EM_CI_RUNNER_IMAGE }}
+        run: |
+          set -euo pipefail
+
+          case "$REQUESTED_PROFILE" in
+            light|standard|heavy|large) ;;
+            *)
+              echo "::error::unknown EM CI Python profile: $REQUESTED_PROFILE"
+              exit 64
+              ;;
+          esac
+          case "$REQUESTED_PYTHON" in
+            3.11|3.12|3.13) ;;
+            *)
+              echo "::error::unsupported Python series: $REQUESTED_PYTHON"
+              exit 64
+              ;;
+          esac
+          [[ "$REQUESTED_LANE" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] || {
+            echo "::error::lane must match ^[a-z0-9][a-z0-9_-]{0,31}$"
+            exit 64
+          }
+          case "$REQUESTED_FETCH_DEPTH" in
+            0|1) ;;
+            *)
+              echo "::error::fetch_depth must be 0 or 1"
+              exit 64
+              ;;
+          esac
+
+          if [[ "${HOSTED_ENABLED,,}" == true ]]; then
+            hosted_enabled=true
+          else
+            hosted_enabled=false
+          fi
+
+          case "$GITHUB_EVENT_NAME" in
+            push|merge_group|workflow_dispatch|schedule)
+              self_hosted=true
+              ;;
+            pull_request)
+              head_repo=$(jq -r '.pull_request.head.repo.full_name // ""' "$GITHUB_EVENT_PATH")
+              author_type=$(jq -r '.pull_request.user.type // ""' "$GITHUB_EVENT_PATH")
+              if [[ "$head_repo" == "$GITHUB_REPOSITORY" && "$author_type" != Bot ]]; then
+                self_hosted=true
+              else
+                self_hosted=false
+              fi
+              ;;
+            *)
+              echo "::error::event $GITHUB_EVENT_NAME is not approved for the EM CI reusable workflow"
+              exit 64
+              ;;
+          esac
+
+          if [[ "$self_hosted" == false && "$hosted_enabled" == true ]]; then
+            [[ "$RUNNER_IMAGE" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]] || {
+              echo '::error::EM_CI_RUNNER_IMAGE must be an immutable GHCR sha256 digest reference'
+              exit 64
+            }
+          fi
+
+          {
+            echo "profile=$REQUESTED_PROFILE"
+            echo "python=$REQUESTED_PYTHON"
+            echo "lane=$REQUESTED_LANE"
+            echo "self_hosted=$self_hosted"
+            echo "hosted_enabled=$hosted_enabled"
+            echo "runner_image=$RUNNER_IMAGE"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo '## EM CI Python classification'
+            echo
+            echo "- profile: \`$REQUESTED_PROFILE\`"
+            echo "- python: \`$REQUESTED_PYTHON\`"
+            echo "- lane: \`$REQUESTED_LANE\`"
+            echo "- fetch_depth: \`$REQUESTED_FETCH_DEPTH\`"
+            echo "- self_hosted: \`$self_hosted\`"
+            echo "- hosted_enabled: \`$hosted_enabled\`"
+            echo "- event: \`$GITHUB_EVENT_NAME\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  light:
+    name: Python light / ${{ inputs.python }} / ${{ inputs.lane }}
+    needs: classify
+    if: needs.classify.outputs.self_hosted == 'true' && needs.classify.outputs.profile == 'light'
+    runs-on:
+      group: em-ci-build
+      labels: [self-hosted, linux, x64, python-light]
+    timeout-minutes: 45
+    steps: &proof_steps
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ inputs.fetch_depth }}
+
+      - name: Verify Python runtime contract
+        id: runtime
+        shell: bash
+        env:
+          REQUESTED_PYTHON: ${{ needs.classify.outputs.python }}
+          REQUESTED_LANE: ${{ needs.classify.outputs.lane }}
+        run: |
+          set -euo pipefail
+          case "$REQUESTED_PYTHON" in
+            3.11) expected=$EM_CI_PYTHON_311_VERSION ;;
+            3.12) expected=$EM_CI_PYTHON_312_VERSION ;;
+            3.13) expected=$EM_CI_PYTHON_313_VERSION ;;
+            *) echo "::error::unsupported selected Python: $REQUESTED_PYTHON"; exit 64 ;;
+          esac
+
+          python="/home/runner/.local/bin/python${REQUESTED_PYTHON}"
+          [[ -x "$python" ]] || {
+            echo "::error::runner does not expose $python"
+            exit 78
+          }
+          actual=$("$python" --version | awk '{print $2}')
+          [[ "$actual" == "$expected" ]] || {
+            echo "::error::runner resolved Python $actual, expected $expected"
+            exit 78
+          }
+          resolved=$(uv python find "$expected")
+          [[ $(readlink -f "$resolved") == $(readlink -f "$python") ]] || {
+            echo "::error::uv resolved $resolved, expected $python"
+            exit 78
+          }
+
+          venv="$RUNNER_TEMP/python-venv"
+          artifact_dir="$GITHUB_WORKSPACE/.ci/artifacts/$REQUESTED_LANE"
+          rm -rf "$venv"
+          "$python" -m venv "$venv"
+          "$venv/bin/python" -m pip --version
+          "$venv/bin/python" -c 'import ssl, sqlite3, venv'
+          install -d -m 0755 "$artifact_dir"
+
+          {
+            echo "EM_CI_PYTHON=$venv/bin/python"
+            echo "EM_CI_PIP=$venv/bin/pip"
+            echo "EM_CI_PYTHON_SERIES=$REQUESTED_PYTHON"
+            echo "EM_CI_PYTHON_VERSION=$expected"
+            echo "EM_CI_LANE=$REQUESTED_LANE"
+            echo "EM_CI_ARTIFACT_DIR=$artifact_dir"
+            echo "PATH=$venv/bin:$PATH"
+          } >> "$GITHUB_ENV"
+
+          echo "Python runtime contract: $expected"
+
+      - name: Record EM CI Python job context
+        shell: bash
+        env:
+          EM_CI_SELECTED_PROFILE: ${{ needs.classify.outputs.profile }}
+          EM_CI_SELF_HOSTED: ${{ needs.classify.outputs.self_hosted }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg schema 'em-ci-python-job-context.v1' \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg workflow "$GITHUB_WORKFLOW" \
+            --arg workflow_ref "$GITHUB_WORKFLOW_REF" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg job "$GITHUB_JOB" \
+            --arg event "$GITHUB_EVENT_NAME" \
+            --arg ref "$GITHUB_REF" \
+            --arg sha "$GITHUB_SHA" \
+            --arg profile "$EM_CI_SELECTED_PROFILE" \
+            --arg self_hosted "$EM_CI_SELF_HOSTED" \
+            --arg python_series "$EM_CI_PYTHON_SERIES" \
+            --arg python_version "$EM_CI_PYTHON_VERSION" \
+            --arg lane "$EM_CI_LANE" \
+            --arg started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{schema:$schema,repository:$repository,workflow:$workflow,workflow_ref:$workflow_ref,run_id:$run_id,run_attempt:$run_attempt,job:$job,event:$event,ref:$ref,sha:$sha,profile:$profile,self_hosted:($self_hosted == "true"),python_series:$python_series,python_version:$python_version,lane:$lane,proof_started_at:$started_at}' \
+            > "$RUNNER_TEMP/em-ci-python-job-context.json"
+
+      - name: Run repository proof
+        shell: bash
+        env:
+          EM_CI_PROOF_SCRIPT: ${{ inputs.script }}
+        run: |
+          set -euo pipefail
+          [[ "$EM_CI_PROOF_SCRIPT" =~ ^[A-Za-z0-9._/-]+$ ]]
+          [[ "$EM_CI_PROOF_SCRIPT" != /* ]]
+          [[ "$EM_CI_PROOF_SCRIPT" != *..* ]]
+          [[ -f "$EM_CI_PROOF_SCRIPT" ]]
+          bash -- "$EM_CI_PROOF_SCRIPT"
+
+      - name: Finalize EM CI Python job context
+        if: always()
+        shell: bash
+        env:
+          EM_CI_JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          context="$RUNNER_TEMP/em-ci-python-job-context.json"
+          [[ -f "$context" ]] || exit 0
+          temporary="$context.tmp"
+          jq \
+            --arg status "$EM_CI_JOB_STATUS" \
+            --arg finished_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '. + {job_status:$status,proof_finished_at:$finished_at}' \
+            "$context" > "$temporary"
+          mv "$temporary" "$context"
+          cp -- "$context" "$EM_CI_ARTIFACT_DIR/em-ci-python-job-context.json"
+
+      - name: Preserve self-hosted job evidence
+        if: always() && needs.classify.outputs.self_hosted == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_dir=/home/runner/_diag/em-ci-evidence
+          install -d -m 0755 "$evidence_dir"
+          context="$RUNNER_TEMP/em-ci-python-job-context.json"
+          [[ -f "$context" ]] && cp -- "$context" "$evidence_dir/$(basename "$context")"
+
+      - name: Upload bounded Python proof artifacts
+        if: always() && inputs.upload_artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: em-ci-python-${{ inputs.lane }}-${{ inputs.python }}-${{ github.run_attempt }}
+          path: .ci/artifacts/${{ inputs.lane }}
+          if-no-files-found: warn
+          retention-days: 14
+
+  standard:
+    name: Python standard / ${{ inputs.python }} / ${{ inputs.lane }}
+    needs: classify
+    if: needs.classify.outputs.self_hosted == 'true' && needs.classify.outputs.profile == 'standard'
+    runs-on:
+      group: em-ci-build
+      labels: [self-hosted, linux, x64, python-standard]
+    timeout-minutes: 75
+    steps: *proof_steps
+
+  heavy:
+    name: Python heavy / ${{ inputs.python }} / ${{ inputs.lane }}
+    needs: classify
+    if: needs.classify.outputs.self_hosted == 'true' && needs.classify.outputs.profile == 'heavy'
+    runs-on:
+      group: em-ci-build
+      labels: [self-hosted, linux, x64, python-heavy]
+    timeout-minutes: 150
+    steps: *proof_steps
+
+  large:
+    name: Python large / ${{ inputs.python }} / ${{ inputs.lane }}
+    needs: classify
+    if: needs.classify.outputs.self_hosted == 'true' && needs.classify.outputs.profile == 'large'
+    runs-on:
+      group: em-ci-build
+      labels: [self-hosted, linux, x64, python-large]
+    timeout-minutes: 240
+    steps: *proof_steps
+
+  hosted:
+    name: Python hosted external / ${{ inputs.python }} / ${{ inputs.lane }}
+    needs: classify
+    if: needs.classify.outputs.self_hosted == 'false' && needs.classify.outputs.hosted_enabled == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    container:
+      image: ${{ needs.classify.outputs.runner_image }}
+      options: --user 0
+    steps: *proof_steps
+
+  external-unavailable:
+    name: Python hosted external unavailable
+    needs: classify
+    if: needs.classify.outputs.self_hosted == 'false' && needs.classify.outputs.hosted_enabled != 'true'
+    runs-on:
+      group: em-ci-build
+      labels: [self-hosted, linux, x64, ci-control]
+    timeout-minutes: 5
+    steps:
+      # No checkout: external source must never fall through to the trusted fleet.
+      - name: Report unavailable external route
+        shell: bash
+        run: |
+          echo '::error::GitHub-hosted EM CI is currently disabled; external and bot pull requests cannot run on the trusted self-hosted fleet.'
+          exit 75
+
+  result:
+    name: Python CI / Required
+    needs: [classify, light, standard, heavy, large, hosted, external-unavailable]
+    if: always()
+    runs-on:
+      group: em-ci-build
+      labels: [self-hosted, linux, x64, ci-control]
+    timeout-minutes: 5
+    steps:
+      - name: Evaluate selected implementation
+        shell: bash
+        env:
+          CLASSIFY_RESULT: ${{ needs.classify.result }}
+          PROFILE: ${{ needs.classify.outputs.profile }}
+          SELF_HOSTED: ${{ needs.classify.outputs.self_hosted }}
+          HOSTED_ENABLED: ${{ needs.classify.outputs.hosted_enabled }}
+          LIGHT_RESULT: ${{ needs.light.result }}
+          STANDARD_RESULT: ${{ needs.standard.result }}
+          HEAVY_RESULT: ${{ needs.heavy.result }}
+          LARGE_RESULT: ${{ needs.large.result }}
+          HOSTED_RESULT: ${{ needs.hosted.result }}
+          EXTERNAL_UNAVAILABLE_RESULT: ${{ needs.external-unavailable.result }}
+        run: |
+          set -euo pipefail
+
+          [[ "$CLASSIFY_RESULT" == success ]] || {
+            echo "::error::classification failed: $CLASSIFY_RESULT"
+            exit 1
+          }
+
+          if [[ "$SELF_HOSTED" == false ]]; then
+            if [[ "$HOSTED_ENABLED" == true ]]; then
+              selected=$HOSTED_RESULT
+            else
+              selected=$EXTERNAL_UNAVAILABLE_RESULT
+            fi
+          else
+            case "$PROFILE" in
+              light) selected=$LIGHT_RESULT ;;
+              standard) selected=$STANDARD_RESULT ;;
+              heavy) selected=$HEAVY_RESULT ;;
+              large) selected=$LARGE_RESULT ;;
+              *) echo "::error::invalid selected profile: $PROFILE"; exit 1 ;;
+            esac
+          fi
+
+          {
+            echo '## Python CI result'
+            echo
+            echo "- profile: \`$PROFILE\`"
+            echo "- python: \`${{ needs.classify.outputs.python }}\`"
+            echo "- lane: \`${{ needs.classify.outputs.lane }}\`"
+            echo "- self_hosted: \`$SELF_HOSTED\`"
+            echo "- hosted_enabled: \`$HOSTED_ENABLED\`"
+            echo "- selected_result: \`$selected\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          [[ "$selected" == success ]] || {
+            echo "::error::selected proof did not succeed: $selected"
+            exit 1
+          }

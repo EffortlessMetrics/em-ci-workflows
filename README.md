@@ -6,7 +6,9 @@ distribution of internal `EffortlessMetrics/em-ci`.
 
 It contains no host inventory, credentials, runner-management code, provider
 addresses, or private configuration. Public and internal consumers pin the
-reusable workflow by full commit SHA:
+reusable workflow by full commit SHA.
+
+## Rust consumer
 
 ```yaml
 jobs:
@@ -18,8 +20,40 @@ jobs:
       fetch_depth: 1
 ```
 
-Use `fetch_depth: 0` only when the proof script compares revisions, such as
-`cargo-allow diff --base origin/$GITHUB_BASE_REF`.
+## Python consumer
+
+```yaml
+jobs:
+  python:
+    uses: EffortlessMetrics/em-ci-workflows/.github/workflows/python.yml@FULL_COMMIT_SHA
+    with:
+      profile: standard
+      python: '3.13'
+      lane: verify
+      script: .ci/python-verify.sh
+      fetch_depth: 1
+      upload_artifacts: true
+```
+
+The Python proof script receives:
+
+```text
+EM_CI_PYTHON
+EM_CI_PIP
+EM_CI_PYTHON_SERIES
+EM_CI_PYTHON_VERSION
+EM_CI_LANE
+EM_CI_ARTIFACT_DIR
+```
+
+`EM_CI_PYTHON` and `EM_CI_PIP` point into a fresh per-job venv created from the
+exact pinned Python runtime. A proof may write bounded retained evidence only
+under `.ci/artifacts/<lane>`; the central workflow owns artifact publication.
+The lane must be a lowercase safe identifier and is used in the artifact name.
+
+Use `fetch_depth: 0` only when the proof script compares revisions. Consumer
+workflows cannot provide `runs-on`, a container image, an arbitrary shell body,
+or an artifact path.
 
 Profiles are capability contracts:
 
@@ -28,20 +62,24 @@ Profiles are capability contracts:
 - `heavy`: CX43 full 8 guest vCPUs / 8 build/test threads / 13 GiB; CX53 normal sees all 16 guest vCPUs with 8 build/test threads / 12 GiB
 - `large`: exclusive CX53 with full 16 guest vCPUs / 16 build/test threads / 28 GiB
 
+Rust and Python use parallel language-specific labels over those envelopes. The
+consumer selects only the reviewed profile input; the reusable workflow maps it
+to one fixed capability label.
+
 CPU access is work-conserving. A slot's Docker ceiling equals the host's full
 guest-vCPU count; no profile pins CPU IDs or withholds whole guest CPUs for host
 overhead. Both CX53 normal slots use the full 16-vCPU ceiling and equal CPU
 weight, so one active job can use idle capacity while two active jobs share the
-machine. Memory, no-swap, disk, inodes, PIDs, build/test parallelism, and
+machine. Memory, no-swap, disk, inodes, PIDs, language-specific parallelism, and
 simultaneous slot count remain independent boundaries.
 
-The workflow's small `ci-control` jobs execute only this full-SHA-pinned workflow
+The workflows' small `ci-control` jobs execute only full-SHA-pinned workflow
 source. They do not check out caller-controlled source or receive repository
-secrets. Actual Rust proof runs only on the requested capability.
+secrets. Actual proof runs only on the requested language capability.
 
-The workflow routes same-repository, non-bot PRs and approved owned events to the
-trusted self-hosted pool. Fork and bot-authored PRs run on GitHub-hosted Ubuntu
-using the same public runner image only when:
+The workflows route same-repository, non-bot PRs and approved owned events to
+the trusted self-hosted pool. Fork and bot-authored PRs run on GitHub-hosted
+Ubuntu using the same public runner image only when:
 
 ```text
 EM_CI_GITHUB_HOSTED_ENABLED=true
@@ -61,10 +99,12 @@ EM_CI_GITHUB_HOSTED_ENABLED=false|true
 `EM_CI_RUNNER_IMAGE` must be an immutable GHCR digest. The GHCR package must
 allow anonymous pulls before hosted external-PR jobs are enabled.
 
-Branch protection should require only:
+Branch protection should require only the normalized result for the language
+workflow the repository uses:
 
 ```text
 Rust CI / Required
+Python CI / Required
 ```
 
 Do not require conditional implementation jobs.
