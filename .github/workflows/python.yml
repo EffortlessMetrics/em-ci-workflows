@@ -54,6 +54,8 @@ jobs:
       profile: ${{ steps.classify.outputs.profile }}
       python: ${{ steps.classify.outputs.python }}
       lane: ${{ steps.classify.outputs.lane }}
+      target_repository: ${{ steps.classify.outputs.target_repository }}
+      target_sha: ${{ steps.classify.outputs.target_sha }}
       self_hosted: ${{ steps.classify.outputs.self_hosted }}
       hosted_enabled: ${{ steps.classify.outputs.hosted_enabled }}
       runner_image: ${{ steps.classify.outputs.runner_image }}
@@ -107,11 +109,14 @@ jobs:
           case "$GITHUB_EVENT_NAME" in
             push|merge_group|workflow_dispatch|schedule)
               self_hosted=true
+              target_repository=$GITHUB_REPOSITORY
+              target_sha=$GITHUB_SHA
               ;;
             pull_request)
-              head_repo=$(jq -r '.pull_request.head.repo.full_name // ""' "$GITHUB_EVENT_PATH")
+              target_repository=$(jq -r '.pull_request.head.repo.full_name // ""' "$GITHUB_EVENT_PATH")
+              target_sha=$(jq -r '.pull_request.head.sha // ""' "$GITHUB_EVENT_PATH")
               author_type=$(jq -r '.pull_request.user.type // ""' "$GITHUB_EVENT_PATH")
-              if [[ "$head_repo" == "$GITHUB_REPOSITORY" && "$author_type" != Bot ]]; then
+              if [[ "$target_repository" == "$GITHUB_REPOSITORY" && "$author_type" != Bot ]]; then
                 self_hosted=true
               else
                 self_hosted=false
@@ -122,6 +127,15 @@ jobs:
               exit 64
               ;;
           esac
+
+          [[ "$target_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+            echo "::error::invalid target repository: $target_repository"
+            exit 64
+          }
+          [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::invalid target SHA: $target_sha"
+            exit 64
+          }
 
           if [[ "$self_hosted" == false && "$hosted_enabled" == true ]]; then
             [[ "$RUNNER_IMAGE" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]] || {
@@ -134,6 +148,8 @@ jobs:
             echo "profile=$REQUESTED_PROFILE"
             echo "python=$REQUESTED_PYTHON"
             echo "lane=$REQUESTED_LANE"
+            echo "target_repository=$target_repository"
+            echo "target_sha=$target_sha"
             echo "self_hosted=$self_hosted"
             echo "hosted_enabled=$hosted_enabled"
             echo "runner_image=$RUNNER_IMAGE"
@@ -146,6 +162,8 @@ jobs:
             echo "- python: \`$REQUESTED_PYTHON\`"
             echo "- lane: \`$REQUESTED_LANE\`"
             echo "- fetch_depth: \`$REQUESTED_FETCH_DEPTH\`"
+            echo "- target_repository: \`$target_repository\`"
+            echo "- target_sha: \`$target_sha\`"
             echo "- self_hosted: \`$self_hosted\`"
             echo "- hosted_enabled: \`$hosted_enabled\`"
             echo "- event: \`$GITHUB_EVENT_NAME\`"
@@ -162,8 +180,23 @@ jobs:
     steps: &proof_steps
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
         with:
+          repository: ${{ needs.classify.outputs.target_repository }}
+          ref: ${{ needs.classify.outputs.target_sha }}
           persist-credentials: false
           fetch-depth: ${{ inputs.fetch_depth }}
+
+      - name: Verify exact checked-out revision
+        shell: bash
+        env:
+          TARGET_REPOSITORY: ${{ needs.classify.outputs.target_repository }}
+          TARGET_SHA: ${{ needs.classify.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          [[ "$actual" == "$TARGET_SHA" ]] || {
+            echo "::error::checked out $actual, expected $TARGET_SHA from $TARGET_REPOSITORY"
+            exit 78
+          }
 
       - name: Verify Python runtime contract
         id: runtime
@@ -171,6 +204,8 @@ jobs:
         env:
           REQUESTED_PYTHON: ${{ needs.classify.outputs.python }}
           REQUESTED_LANE: ${{ needs.classify.outputs.lane }}
+          TARGET_REPOSITORY: ${{ needs.classify.outputs.target_repository }}
+          TARGET_SHA: ${{ needs.classify.outputs.target_sha }}
         run: |
           set -euo pipefail
           case "$REQUESTED_PYTHON" in
@@ -210,6 +245,8 @@ jobs:
             echo "EM_CI_PYTHON_SERIES=$REQUESTED_PYTHON"
             echo "EM_CI_PYTHON_VERSION=$expected"
             echo "EM_CI_LANE=$REQUESTED_LANE"
+            echo "EM_CI_TARGET_REPOSITORY=$TARGET_REPOSITORY"
+            echo "EM_CI_TARGET_SHA=$TARGET_SHA"
             echo "EM_CI_ARTIFACT_DIR=$artifact_dir"
             echo "PATH=$venv/bin:$PATH"
           } >> "$GITHUB_ENV"
@@ -221,6 +258,8 @@ jobs:
         env:
           EM_CI_SELECTED_PROFILE: ${{ needs.classify.outputs.profile }}
           EM_CI_SELF_HOSTED: ${{ needs.classify.outputs.self_hosted }}
+          EM_CI_TARGET_REPOSITORY: ${{ needs.classify.outputs.target_repository }}
+          EM_CI_TARGET_SHA: ${{ needs.classify.outputs.target_sha }}
         run: |
           set -euo pipefail
           jq -n \
@@ -233,14 +272,16 @@ jobs:
             --arg job "$GITHUB_JOB" \
             --arg event "$GITHUB_EVENT_NAME" \
             --arg ref "$GITHUB_REF" \
-            --arg sha "$GITHUB_SHA" \
+            --arg event_sha "$GITHUB_SHA" \
+            --arg target_repository "$EM_CI_TARGET_REPOSITORY" \
+            --arg target_sha "$EM_CI_TARGET_SHA" \
             --arg profile "$EM_CI_SELECTED_PROFILE" \
             --arg self_hosted "$EM_CI_SELF_HOSTED" \
             --arg python_series "$EM_CI_PYTHON_SERIES" \
             --arg python_version "$EM_CI_PYTHON_VERSION" \
             --arg lane "$EM_CI_LANE" \
             --arg started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{schema:$schema,repository:$repository,workflow:$workflow,workflow_ref:$workflow_ref,run_id:$run_id,run_attempt:$run_attempt,job:$job,event:$event,ref:$ref,sha:$sha,profile:$profile,self_hosted:($self_hosted == "true"),python_series:$python_series,python_version:$python_version,lane:$lane,proof_started_at:$started_at}' \
+            '{schema:$schema,repository:$repository,workflow:$workflow,workflow_ref:$workflow_ref,run_id:$run_id,run_attempt:$run_attempt,job:$job,event:$event,ref:$ref,sha:$target_sha,event_sha:$event_sha,target_repository:$target_repository,target_sha:$target_sha,profile:$profile,self_hosted:($self_hosted == "true"),python_series:$python_series,python_version:$python_version,lane:$lane,proof_started_at:$started_at}' \
             > "$RUNNER_TEMP/em-ci-python-job-context.json"
 
       - name: Run repository proof
@@ -363,6 +404,8 @@ jobs:
         env:
           CLASSIFY_RESULT: ${{ needs.classify.result }}
           PROFILE: ${{ needs.classify.outputs.profile }}
+          TARGET_REPOSITORY: ${{ needs.classify.outputs.target_repository }}
+          TARGET_SHA: ${{ needs.classify.outputs.target_sha }}
           SELF_HOSTED: ${{ needs.classify.outputs.self_hosted }}
           HOSTED_ENABLED: ${{ needs.classify.outputs.hosted_enabled }}
           LIGHT_RESULT: ${{ needs.light.result }}
@@ -401,6 +444,8 @@ jobs:
             echo "- profile: \`$PROFILE\`"
             echo "- python: \`${{ needs.classify.outputs.python }}\`"
             echo "- lane: \`${{ needs.classify.outputs.lane }}\`"
+            echo "- target_repository: \`$TARGET_REPOSITORY\`"
+            echo "- target_sha: \`$TARGET_SHA\`"
             echo "- self_hosted: \`$SELF_HOSTED\`"
             echo "- hosted_enabled: \`$HOSTED_ENABLED\`"
             echo "- selected_result: \`$selected\`"

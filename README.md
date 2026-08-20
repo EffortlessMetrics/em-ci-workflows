@@ -43,6 +43,8 @@ EM_CI_PIP
 EM_CI_PYTHON_SERIES
 EM_CI_PYTHON_VERSION
 EM_CI_LANE
+EM_CI_TARGET_REPOSITORY
+EM_CI_TARGET_SHA
 EM_CI_ARTIFACT_DIR
 ```
 
@@ -50,6 +52,15 @@ EM_CI_ARTIFACT_DIR
 exact pinned Python runtime. A proof may write bounded retained evidence only
 under `.ci/artifacts/<lane>`; the central workflow owns artifact publication.
 The lane must be a lowercase safe identifier and is used in the artifact name.
+
+The classifier derives the source repository and immutable commit from the
+triggering event. Pull requests use `pull_request.head.repo.full_name` and
+`pull_request.head.sha`, not GitHub's synthetic merge ref. Owned push,
+merge-group, scheduled, and manually dispatched events use their exact event
+repository and SHA. Checkout receives both classified values explicitly and the
+workflow compares `git rev-parse HEAD` with the classified SHA before any
+repository script executes. Job context retains the target SHA separately from
+the event SHA.
 
 Use `fetch_depth: 0` only when the proof script compares revisions. Consumer
 workflows cannot provide `runs-on`, a container image, an arbitrary shell body,
