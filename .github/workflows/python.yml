@@ -225,7 +225,17 @@ jobs:
             echo "::error::runner resolved Python $actual, expected $expected"
             exit 78
           }
-          resolved=$(uv python find "$expected")
+          # This is a platform check of the activated runner image, so it must
+          # not consult caller project configuration. Without --no-config, uv
+          # loads the checked-out pyproject.toml; a consumer pinning
+          # [tool.uv] required-version to anything other than the image's uv
+          # makes uv exit before doing any work, which aborted this step through
+          # command substitution without emitting any platform annotation.
+          # Repository-owned proof still sees and enforces its own uv policy.
+          if ! resolved=$(uv --no-config python find "$expected"); then
+            echo "::error::the activated runner image cannot resolve managed Python $expected"
+            exit 78
+          fi
           [[ $(readlink -f "$resolved") == $(readlink -f "$python") ]] || {
             echo "::error::uv resolved $resolved, expected $python"
             exit 78
