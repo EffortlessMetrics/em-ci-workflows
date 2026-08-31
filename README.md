@@ -33,6 +33,7 @@ jobs:
       script: .ci/python-verify.sh
       fetch_depth: 1
       upload_artifacts: true
+      require_media: false
 ```
 
 The Python proof script receives:
@@ -43,6 +44,7 @@ EM_CI_PIP
 EM_CI_PYTHON_SERIES
 EM_CI_PYTHON_VERSION
 EM_CI_LANE
+EM_CI_REQUIRE_MEDIA
 EM_CI_TARGET_REPOSITORY
 EM_CI_TARGET_SHA
 EM_CI_ARTIFACT_DIR
@@ -52,6 +54,10 @@ EM_CI_ARTIFACT_DIR
 exact pinned Python runtime. A proof may write bounded retained evidence only
 under `.ci/artifacts/<lane>`; the central workflow owns artifact publication.
 The lane must be a lowercase safe identifier and is used in the artifact name.
+`require_media: true` adds a fixed SHA-256-verified FFmpeg/ffprobe archive to the selected
+self-hosted Python proof path, records the two safe version lines, and exports
+`EM_CI_REQUIRE_MEDIA=true` to the repository proof. It does not change trust classification;
+hosted external jobs receive the requested value but do not install the self-hosted overlay.
 
 The classifier derives the source repository and immutable commit from the
 triggering event. Pull requests use `pull_request.head.repo.full_name` and
