@@ -31,9 +31,7 @@ env:
 jobs:
   classify:
     name: Classify trust and profile
-    runs-on:
-      group: em-ci-build
-      labels: [self-hosted, linux, x64, ci-control]
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       profile: ${{ steps.classify.outputs.profile }}
@@ -309,9 +307,7 @@ jobs:
     name: Rust hosted external unavailable
     needs: classify
     if: needs.classify.outputs.self_hosted == 'false' && needs.classify.outputs.hosted_enabled != 'true'
-    runs-on:
-      group: em-ci-build
-      labels: [self-hosted, linux, x64, ci-control]
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       # No checkout: external source must never fall through to the trusted fleet.
@@ -325,9 +321,7 @@ jobs:
     name: Rust CI / Required
     needs: [classify, light, standard, heavy, large, hosted, external-unavailable]
     if: always()
-    runs-on:
-      group: em-ci-build
-      labels: [self-hosted, linux, x64, ci-control]
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Evaluate selected implementation
