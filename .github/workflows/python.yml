@@ -51,9 +51,7 @@ env:
 jobs:
   classify:
     name: Classify trust and Python profile
-    runs-on:
-      group: em-ci-build
-      labels: [self-hosted, linux, x64, ci-control]
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       profile: ${{ steps.classify.outputs.profile }}
@@ -265,7 +263,7 @@ jobs:
             echo "EM_CI_PYTHON_SERIES=$REQUESTED_PYTHON"
             echo "EM_CI_PYTHON_VERSION=$expected"
             echo "EM_CI_LANE=$REQUESTED_LANE"
-            echo "EM_CI_REQUIRE_MEDIA=$REQUESTED_REQUIRE_MEDIA"
+            echo "EM_CI_REQUIRE_MEDIA=${REQUESTED_REQUIRE_MEDIA:-false}"
             echo "EM_CI_TARGET_REPOSITORY=$TARGET_REPOSITORY"
             echo "EM_CI_TARGET_SHA=$TARGET_SHA"
             echo "EM_CI_ARTIFACT_DIR=$artifact_dir"
@@ -292,6 +290,11 @@ jobs:
             --location \
             --proto '=https' \
             --proto-redir '=https' \
+            --connect-timeout 15 \
+            --max-time 300 \
+            --retry 3 \
+            --retry-delay 2 \
+            --retry-all-errors \
             --silent \
             --show-error \
             --output "$archive" \
@@ -448,9 +451,7 @@ jobs:
     name: Python hosted external unavailable
     needs: classify
     if: needs.classify.outputs.self_hosted == 'false' && needs.classify.outputs.hosted_enabled != 'true'
-    runs-on:
-      group: em-ci-build
-      labels: [self-hosted, linux, x64, ci-control]
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       # No checkout: external source must never fall through to the trusted fleet.
@@ -464,9 +465,7 @@ jobs:
     name: Python CI / Required
     needs: [classify, light, standard, heavy, large, hosted, external-unavailable]
     if: always()
-    runs-on:
-      group: em-ci-build
-      labels: [self-hosted, linux, x64, ci-control]
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Evaluate selected implementation

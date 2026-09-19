@@ -75,7 +75,7 @@ or an artifact path.
 Profiles are capability contracts:
 
 - `light`: full 4 guest vCPUs / 4 build/test threads / 6 GiB
-- `standard`: full 6 guest vCPUs / 6 build/test threads / 9 GiB on VPS20
+- `standard`: full 6 guest vCPUs / 6 build/test threads / up to 10240 MiB on VPS20
 - `heavy`: CX43 full 8 guest vCPUs / 8 build/test threads / 13 GiB; CX53 normal sees all 16 guest vCPUs with 8 build/test threads / 12 GiB
 - `large`: exclusive CX53 with full 16 guest vCPUs / 16 build/test threads / 28 GiB
 
@@ -83,16 +83,17 @@ Rust and Python use parallel language-specific labels over those envelopes. The
 consumer selects only the reviewed profile input; the reusable workflow maps it
 to one fixed capability label.
 
-CPU access is work-conserving. A slot's Docker ceiling equals the host's full
+CPU and memory access are work-conserving. On a single-slot VPS20, the 9984-MiB soft boundary and 10240-MiB hard cgroup ceiling contain pressure/runaway use without treating the hard ceiling as pre-allocated RAM. CPU access is work-conserving. A slot's Docker ceiling equals the host's full
 guest-vCPU count; no profile pins CPU IDs or withholds whole guest CPUs for host
 overhead. Both CX53 normal slots use the full 16-vCPU ceiling and equal CPU
 weight, so one active job can use idle capacity while two active jobs share the
 machine. Memory, no-swap, disk, inodes, PIDs, language-specific parallelism, and
 simultaneous slot count remain independent boundaries.
 
-The workflows' small `ci-control` jobs execute only full-SHA-pinned workflow
-source. They do not check out caller-controlled source or receive repository
-secrets. Actual proof runs only on the requested language capability.
+The workflows' pure control jobs (`classify`, `external-unavailable`, and `result`) execute
+on GitHub-hosted Ubuntu using only full-SHA-pinned workflow source. They do not check
+out caller-controlled source or receive repository secrets. Actual proof runs only on the
+requested language capability.
 
 The workflows route same-repository, non-bot PRs and approved owned events to
 the trusted self-hosted pool. Fork and bot-authored PRs run on GitHub-hosted
