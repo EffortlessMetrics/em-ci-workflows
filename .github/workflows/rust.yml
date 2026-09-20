@@ -25,8 +25,9 @@ env:
   # The reusable workflow and image move together. Keeping this explicit lets the
   # currently activated image enforce the same version before the replacement
   # image carrying the ENV marker is published and activated.
-  EM_CI_RUST_VERSION: "1.97.1"
-  RUSTUP_TOOLCHAIN: "1.97.1"
+  EM_CI_RUST_VERSION: "1.98.1"
+  EM_CI_RUST_COMPATIBILITY_VERSION: "1.95.0"
+  RUSTUP_TOOLCHAIN: "1.98.1"
 
 jobs:
   classify:
@@ -133,20 +134,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected=$EM_CI_RUST_VERSION
-          [[ "$expected" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-            echo '::error::the reusable workflow does not expose an exact EM CI Rust version'
+          primary=$EM_CI_RUST_VERSION
+          compat=${EM_CI_RUST_COMPATIBILITY_VERSION:-}
+          [[ "$primary" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo '::error::the reusable workflow does not expose an exact EM CI primary Rust version'
             exit 78
           }
-          [[ "$RUSTUP_TOOLCHAIN" == "$expected" ]] || {
-            echo "::error::RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN, expected $expected"
-            exit 78
-          }
-          actual=$(rustc --version | awk '{print $2}')
-          [[ "$actual" == "$expected" ]] || {
-            echo "::error::runner resolved Rust $actual, expected $expected"
-            exit 78
-          }
+          if [[ -n "$compat" ]]; then
+            [[ "$compat" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo '::error::the reusable workflow does not expose an exact EM CI compatibility Rust version'
+              exit 78
+            }
+          fi
 
           requested=''
           toolchain_file=''
@@ -172,11 +171,24 @@ jobs:
               requested=$(tr -d '[:space:]' < "$toolchain_file")
             fi
           fi
-          if [[ -n "$requested" && "$requested" != "$expected" ]]; then
-            echo "::error::$toolchain_file requests Rust $requested, but EM CI is activated on $expected"
+
+          if [[ -z "$requested" || "$requested" == "$primary" ]]; then
+            selected=$primary
+          elif [[ -n "$compat" && "$requested" == "$compat" ]]; then
+            selected=$compat
+          else
+            echo "::error::$toolchain_file requests Rust '$requested', but EM CI only supports primary ($primary) or compatibility (${compat:-none})"
             exit 78
           fi
-          echo "Rust toolchain contract: $expected"
+
+          actual=$(rustc +"$selected" --version | awk '{print $2}')
+          [[ "$actual" == "$selected" ]] || {
+            echo "::error::runner resolved Rust $actual for toolchain $selected, expected $selected"
+            exit 78
+          }
+
+          echo "RUSTUP_TOOLCHAIN=$selected" >> "$GITHUB_ENV"
+          echo "Rust toolchain selected: $selected"
       - name: Record EM CI job context
         shell: bash
         env:
