@@ -2,7 +2,16 @@ name: EM CI Rust
 
 on:
   workflow_call:
+    outputs:
+      evidence:
+        description: Subject-bound selected proof result; missing evidence is NOT_PROVEN
+        value: ${{ jobs.result.outputs.evidence }}
     inputs:
+      force_hosted:
+        description: Use the enabled hosted route; never grants external source trusted access
+        required: false
+        default: false
+        type: boolean
       profile:
         description: light, standard, heavy, or large
         required: true
@@ -45,6 +54,7 @@ jobs:
       - id: classify
         shell: bash
         env:
+          REQUESTED_FORCE_HOSTED: ${{ inputs.force_hosted }}
           REQUESTED_PROFILE: ${{ inputs.profile }}
           REQUESTED_FETCH_DEPTH: ${{ inputs.fetch_depth }}
           HOSTED_ENABLED: ${{ vars.EM_CI_GITHUB_HOSTED_ENABLED }}
@@ -93,7 +103,19 @@ jobs:
               ;;
           esac
 
-          if [[ "$self_hosted" == false && "$hosted_enabled" == true ]]; then
+          case "$REQUESTED_FORCE_HOSTED" in
+            true)
+              [[ "$hosted_enabled" == true ]] || {
+                echo '::error::forced hosted execution requires the existing hosted-enable policy'
+                exit 64
+              }
+              self_hosted=false
+              ;;
+            false) ;;
+            *) echo '::error::force_hosted must be a boolean'; exit 64 ;;
+          esac
+
+          if [[ "$hosted_enabled" == true ]]; then
             [[ "$RUNNER_IMAGE" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]] || {
               echo '::error::EM_CI_RUNNER_IMAGE must be an immutable GHCR sha256 digest reference'
               exit 64
@@ -125,12 +147,19 @@ jobs:
       group: em-ci-build
       labels: [self-hosted, linux, x64, rust-light]
     timeout-minutes: 45
+    env:
+      EM_CI_EXECUTION_SELF_HOSTED: "true"
+    outputs: &proof_outputs
+      infrastructure_failure: ${{ steps.toolchain.outputs.infrastructure_failure || steps.prepare.outputs.infrastructure_failure }}
+      proof_outcome: ${{ steps.proof.outcome }}
+      proof_entered_at: ${{ steps.proof.outputs.proof_entered_at }}
     steps: &proof_steps
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
         with:
           persist-credentials: false
           fetch-depth: ${{ inputs.fetch_depth }}
       - name: Verify Rust toolchain contract
+        id: toolchain
         shell: bash
         run: |
           set -euo pipefail
@@ -181,7 +210,20 @@ jobs:
             exit 78
           fi
 
-          actual=$(rustc +"$selected" --version | awk '{print $2}')
+          # Only an approved exact toolchain that cannot execute is eligible.
+          # Repository pin/parse policy and version mismatches stay blocking.
+          # Probe outside the checkout so repository rustup configuration cannot
+          # masquerade as a runner/toolchain availability failure.
+          if ! probe_dir=$(mktemp -d "$RUNNER_TEMP/em-ci-toolchain-probe.XXXXXX"); then
+            echo 'infrastructure_failure=disposable_paths_unavailable' >> "$GITHUB_OUTPUT"
+            echo '::warning::cannot create disposable toolchain probe path; proof admission withdrawn'
+            exit 0
+          fi
+          if ! actual=$(cd "$probe_dir" && rustc +"$selected" --version | awk '{print $2}'); then
+            echo 'infrastructure_failure=toolchain_unavailable' >> "$GITHUB_OUTPUT"
+            echo '::warning::approved immutable-image toolchain cannot execute; proof admission withdrawn'
+            exit 0
+          fi
           [[ "$actual" == "$selected" ]] || {
             echo "::error::runner resolved Rust $actual for toolchain $selected, expected $selected"
             exit 78
@@ -190,10 +232,11 @@ jobs:
           echo "RUSTUP_TOOLCHAIN=$selected" >> "$GITHUB_ENV"
           echo "Rust toolchain selected: $selected"
       - name: Record EM CI job context
+        if: steps.toolchain.outputs.infrastructure_failure == ''
         shell: bash
         env:
           EM_CI_SELECTED_PROFILE: ${{ needs.classify.outputs.profile }}
-          EM_CI_SELF_HOSTED: ${{ needs.classify.outputs.self_hosted }}
+          EM_CI_SELF_HOSTED: ${{ env.EM_CI_EXECUTION_SELF_HOSTED }}
         run: |
           set -euo pipefail
           jq -n \
@@ -210,16 +253,24 @@ jobs:
             --arg profile "$EM_CI_SELECTED_PROFILE" \
             --arg self_hosted "$EM_CI_SELF_HOSTED" \
             --arg started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{schema:$schema,repository:$repository,workflow:$workflow,workflow_ref:$workflow_ref,run_id:$run_id,run_attempt:$run_attempt,job:$job,event:$event,ref:$ref,sha:$sha,profile:$profile,self_hosted:($self_hosted == "true"),proof_started_at:$started_at}' \
+            '{schema:$schema,repository:$repository,workflow:$workflow,workflow_ref:$workflow_ref,run_id:$run_id,run_attempt:$run_attempt,job:$job,event:$event,ref:$ref,sha:$sha,profile:$profile,self_hosted:($self_hosted == "true"),admission_recorded_at:$started_at}' \
             > "$RUNNER_TEMP/em-ci-job-context.json"
       - name: Prepare disposable paths
+        id: prepare
+        if: steps.toolchain.outputs.infrastructure_failure == ''
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/cargo-target" "$RUNNER_TEMP/tmp"
+          if ! mkdir -p "$RUNNER_TEMP/cargo-target" "$RUNNER_TEMP/tmp"; then
+            echo 'infrastructure_failure=disposable_paths_unavailable' >> "$GITHUB_OUTPUT"
+            echo '::warning::cannot create disposable runner paths; proof admission withdrawn'
+            exit 0
+          fi
           echo "CARGO_TARGET_DIR=$RUNNER_TEMP/cargo-target" >> "$GITHUB_ENV"
           echo "TMPDIR=$RUNNER_TEMP/tmp" >> "$GITHUB_ENV"
       - name: Run repository proof
+        id: proof
+        if: steps.toolchain.outcome == 'success' && steps.prepare.outcome == 'success' && steps.toolchain.outputs.infrastructure_failure == '' && steps.prepare.outputs.infrastructure_failure == ''
         shell: bash
         env:
           EM_CI_PROOF_SCRIPT: ${{ inputs.script }}
@@ -229,6 +280,14 @@ jobs:
           [[ "$EM_CI_PROOF_SCRIPT" != /* ]]
           [[ "$EM_CI_PROOF_SCRIPT" != *..* ]]
           [[ -f "$EM_CI_PROOF_SCRIPT" ]]
+          # Validate the repository-owned entry point before recording entry.
+          # The marker is immediately before execution, never path preparation.
+          entered_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          context="$RUNNER_TEMP/em-ci-job-context.json"
+          jq --arg entered_at "$entered_at" '. + {proof_started_at:$entered_at}' \
+            "$context" > "$context.entry"
+          mv -- "$context.entry" "$context"
+          echo "proof_entered_at=$entered_at" >> "$GITHUB_OUTPUT"
           bash -- "$EM_CI_PROOF_SCRIPT"
       - name: Record compiler cache statistics
         if: always()
@@ -257,7 +316,7 @@ jobs:
             "$context" > "$temporary"
           mv "$temporary" "$context"
       - name: Preserve self-hosted job evidence
-        if: always() && needs.classify.outputs.self_hosted == 'true'
+        if: always() && env.EM_CI_EXECUTION_SELF_HOSTED == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -280,6 +339,9 @@ jobs:
       group: em-ci-build
       labels: [self-hosted, linux, x64, rust-standard]
     timeout-minutes: 75
+    env:
+      EM_CI_EXECUTION_SELF_HOSTED: "true"
+    outputs: *proof_outputs
     steps: *proof_steps
 
   heavy:
@@ -290,6 +352,9 @@ jobs:
       group: em-ci-build
       labels: [self-hosted, linux, x64, rust-heavy]
     timeout-minutes: 120
+    env:
+      EM_CI_EXECUTION_SELF_HOSTED: "true"
+    outputs: *proof_outputs
     steps: *proof_steps
 
   large:
@@ -300,6 +365,9 @@ jobs:
       group: em-ci-build
       labels: [self-hosted, linux, x64, rust-large]
     timeout-minutes: 240
+    env:
+      EM_CI_EXECUTION_SELF_HOSTED: "true"
+    outputs: *proof_outputs
     steps: *proof_steps
 
   hosted:
@@ -313,6 +381,9 @@ jobs:
       # GitHub-hosted job containers need root access to the mounted workspace.
       # The same image runs as UID 1001 when it is itself the JIT runner.
       options: --user 0
+    env:
+      EM_CI_EXECUTION_SELF_HOSTED: "false"
+    outputs: *proof_outputs
     steps: *proof_steps
 
   external-unavailable:
@@ -329,14 +400,41 @@ jobs:
           echo '::error::GitHub-hosted EM CI is currently disabled; external and bot pull requests cannot run on the trusted self-hosted fleet.'
           exit 75
 
+  hosted-fallback:
+    name: Rust hosted pre-proof recovery
+    needs: [classify, light, standard, heavy, large]
+    # Only a positively withdrawn admission is normalized; the proof remains skipped.
+    # Queued/cancelled/failed/policy/entered jobs are never eligible.
+    # Execution timeout is not a queue-availability deadline.
+    if: >-
+      ${{ !cancelled() && needs.classify.result == 'success' &&
+          needs.classify.outputs.self_hosted == 'true' &&
+          needs.classify.outputs.hosted_enabled == 'true' &&
+          ((needs.classify.outputs.profile == 'light' && needs.light.result == 'success' && needs.light.outputs.proof_outcome == 'skipped' && (needs.light.outputs.infrastructure_failure == 'toolchain_unavailable' || needs.light.outputs.infrastructure_failure == 'disposable_paths_unavailable')) ||
+           (needs.classify.outputs.profile == 'standard' && needs.standard.result == 'success' && needs.standard.outputs.proof_outcome == 'skipped' && (needs.standard.outputs.infrastructure_failure == 'toolchain_unavailable' || needs.standard.outputs.infrastructure_failure == 'disposable_paths_unavailable')) ||
+           (needs.classify.outputs.profile == 'heavy' && needs.heavy.result == 'success' && needs.heavy.outputs.proof_outcome == 'skipped' && (needs.heavy.outputs.infrastructure_failure == 'toolchain_unavailable' || needs.heavy.outputs.infrastructure_failure == 'disposable_paths_unavailable')) ||
+           (needs.classify.outputs.profile == 'large' && needs.large.result == 'success' && needs.large.outputs.proof_outcome == 'skipped' && (needs.large.outputs.infrastructure_failure == 'toolchain_unavailable' || needs.large.outputs.infrastructure_failure == 'disposable_paths_unavailable'))) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      image: ${{ needs.classify.outputs.runner_image }}
+      options: --user 0
+    env:
+      EM_CI_EXECUTION_SELF_HOSTED: "false"
+    outputs: *proof_outputs
+    steps: *proof_steps
+
   result:
     name: Rust CI / Required
-    needs: [classify, light, standard, heavy, large, hosted, external-unavailable]
+    needs: [classify, light, standard, heavy, large, hosted, hosted-fallback, external-unavailable]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    outputs:
+      evidence: ${{ steps.evaluate.outputs.evidence }}
     steps:
       - name: Evaluate selected implementation
+        id: evaluate
         shell: bash
         env:
           CLASSIFY_RESULT: ${{ needs.classify.result }}
@@ -348,6 +446,29 @@ jobs:
           HEAVY_RESULT: ${{ needs.heavy.result }}
           LARGE_RESULT: ${{ needs.large.result }}
           HOSTED_RESULT: ${{ needs.hosted.result }}
+          LIGHT_INFRASTRUCTURE_FAILURE: ${{ needs.light.outputs.infrastructure_failure }}
+          LIGHT_PROOF_OUTCOME: ${{ needs.light.outputs.proof_outcome }}
+          LIGHT_PROOF_ENTERED_AT: ${{ needs.light.outputs.proof_entered_at }}
+          STANDARD_INFRASTRUCTURE_FAILURE: ${{ needs.standard.outputs.infrastructure_failure }}
+          STANDARD_PROOF_OUTCOME: ${{ needs.standard.outputs.proof_outcome }}
+          STANDARD_PROOF_ENTERED_AT: ${{ needs.standard.outputs.proof_entered_at }}
+          HEAVY_INFRASTRUCTURE_FAILURE: ${{ needs.heavy.outputs.infrastructure_failure }}
+          HEAVY_PROOF_OUTCOME: ${{ needs.heavy.outputs.proof_outcome }}
+          HEAVY_PROOF_ENTERED_AT: ${{ needs.heavy.outputs.proof_entered_at }}
+          LARGE_INFRASTRUCTURE_FAILURE: ${{ needs.large.outputs.infrastructure_failure }}
+          LARGE_PROOF_OUTCOME: ${{ needs.large.outputs.proof_outcome }}
+          LARGE_PROOF_ENTERED_AT: ${{ needs.large.outputs.proof_entered_at }}
+          HOSTED_INFRASTRUCTURE_FAILURE: ${{ needs.hosted.outputs.infrastructure_failure }}
+          HOSTED_PROOF_OUTCOME: ${{ needs.hosted.outputs.proof_outcome }}
+          HOSTED_PROOF_ENTERED_AT: ${{ needs.hosted.outputs.proof_entered_at }}
+          HOSTED_FALLBACK_INFRASTRUCTURE_FAILURE: ${{ needs.hosted-fallback.outputs.infrastructure_failure }}
+          HOSTED_FALLBACK_PROOF_OUTCOME: ${{ needs.hosted-fallback.outputs.proof_outcome }}
+          HOSTED_FALLBACK_PROOF_ENTERED_AT: ${{ needs.hosted-fallback.outputs.proof_entered_at }}
+          HOSTED_FALLBACK_RESULT: ${{ needs.hosted-fallback.result }}
+          SUBJECT_REPOSITORY: ${{ github.repository }}
+          SUBJECT_SHA: ${{ github.sha }}
+          SUBJECT_RUN_ID: ${{ github.run_id }}
+          SUBJECT_RUN_ATTEMPT: ${{ github.run_attempt }}
           EXTERNAL_UNAVAILABLE_RESULT: ${{ needs.external-unavailable.result }}
         run: |
           set -euo pipefail
@@ -373,6 +494,43 @@ jobs:
             esac
           fi
 
+          route=self_hosted
+          if [[ "$SELF_HOSTED" == false ]]; then route=hosted; fi
+          prefix=${PROFILE^^}
+          if [[ "$SELF_HOSTED" == false ]]; then prefix=HOSTED; fi
+          reason_name=${prefix}_INFRASTRUCTURE_FAILURE
+          outcome_name=${prefix}_PROOF_OUTCOME
+          entry_name=${prefix}_PROOF_ENTERED_AT
+          reason=${!reason_name:-}
+          proof_outcome=${!outcome_name:-}
+          proof_entered_at=${!entry_name:-}
+
+          if [[ "$HOSTED_FALLBACK_RESULT" != skipped ]]; then
+            # Recheck the exact eligibility; recovery cannot hide a proof or policy failure.
+            [[ "$SELF_HOSTED" == true && "$HOSTED_ENABLED" == true &&
+               "$selected" == success && "$proof_outcome" == skipped &&
+               -z "$proof_entered_at" ]] || exit 1
+            case "$reason" in
+              toolchain_unavailable|disposable_paths_unavailable) ;;
+              *) exit 1 ;;
+            esac
+            selected=$HOSTED_FALLBACK_RESULT
+            route=hosted_fallback
+            proof_outcome=$HOSTED_FALLBACK_PROOF_OUTCOME
+            proof_entered_at=$HOSTED_FALLBACK_PROOF_ENTERED_AT
+          fi
+
+          # This control step executes no caller code. Missing/failed job outputs
+          # remain blocking; callers must also require this reusable result success.
+          evidence=$(jq -cn \
+            --arg repository "$SUBJECT_REPOSITORY" --arg sha "$SUBJECT_SHA" \
+            --arg run_id "$SUBJECT_RUN_ID" --arg run_attempt "$SUBJECT_RUN_ATTEMPT" \
+            --arg profile "$PROFILE" --arg route "$route" --arg result "$selected" \
+            --arg infrastructure_failure "$reason" --arg proof_outcome "$proof_outcome" \
+            --arg proof_entered_at "$proof_entered_at" \
+            '{schema:"em-ci-rust-result.v1",repository:$repository,sha:$sha,run_id:$run_id,run_attempt:$run_attempt,profile:$profile,route:$route,result:$result,infrastructure_failure:$infrastructure_failure,proof_outcome:$proof_outcome,proof_entered_at:$proof_entered_at}')
+          echo "evidence=$evidence" >> "$GITHUB_OUTPUT"
+
           {
             echo '## Rust CI result'
             echo
@@ -382,7 +540,7 @@ jobs:
             echo "- selected_result: \`$selected\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          [[ "$selected" == success ]] || {
+          [[ "$selected" == success && "$proof_outcome" == success && -n "$proof_entered_at" ]] || {
             echo "::error::selected proof did not succeed: $selected"
             exit 1
           }
