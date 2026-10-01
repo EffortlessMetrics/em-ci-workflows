@@ -92,11 +92,20 @@ simultaneous slot count remain independent boundaries.
 
 The workflows' pure control jobs (`classify`, `external-unavailable`, and `result`) execute
 on GitHub-hosted Ubuntu using only full-SHA-pinned workflow source. They do not check
-out caller-controlled source or receive repository secrets. Actual proof runs only on the
-requested language capability.
+out caller-controlled source or receive repository secrets.
 
-The workflows route same-repository, non-bot PRs and approved owned events to
-the trusted self-hosted pool. Fork and bot-authored PRs run on GitHub-hosted
+Trusted proofs normally run on the requested self-hosted language capability.
+When hosted execution is enabled, Rust callers may request `force_hosted: true`.
+The Rust workflow may also recover on GitHub-hosted Ubuntu after an explicit
+pre-proof `toolchain_unavailable` or `disposable_paths_unavailable` admission
+withdrawal. These hosted routes use the same requested profile and immutable
+runner image. Compiler, test, policy, cancellation and ambiguous failures stay
+blocking. Missing runners may remain queued; this contract does not provide
+prompt automatic recovery from an unmatched self-hosted queue.
+
+The default route for same-repository, non-bot PRs and approved owned events is
+the trusted self-hosted pool, subject to the enabled Rust hosted routes above.
+Fork and bot-authored PRs run on GitHub-hosted
 Ubuntu using the same public runner image only when:
 
 ```text
