@@ -168,6 +168,28 @@ request. This repository is not maintained independently. README, license,
 security-policy, or source-marker-only changes do not change the executable
 workflow contract; callers move only when the workflow blob changes.
 
+## Optional canonical RIPR receipts
+
+Rust callers may set `upload_artifacts: true`, `artifact_lane: ripr` and a
+repository `result_script`. The proof exports current canonical receipts under
+the fresh fixed `.ci/artifacts/ripr` root exposed as `EM_CI_ARTIFACT_DIR`.
+Packages include the reserved finalized `em-ci-job-context.v1`, with a maximum
+of 512 regular files and 8GiB including context. Required upload failure makes
+the producer unsuccessful. Failed-proof diagnostics cannot create proof.
+
+The separate repository-policy job authenticates the current native producer
+attachment, streams and verifies its digest, safely extracts bounded complete
+receipts, and exposes only that verified directory to policy. The defining
+workflow must be pinned by full SHA; caller and native PR/evaluated merge
+identities remain distinct. Policy retains repository domain validation and
+receives `EM_CI_SELECTED_PROOF_RESULT` while the call is unfinished. External
+consumers must still require actual completed-call success.
+
+The immutable aggregate executes no caller code or archive import and withholds
+successful outputs until native policy success and its own small upload pass.
+Default callers are unchanged. Real native/domain/resource qualification and
+the exact workflow allowance precede migration or required-check cutover.
+
 ## Security
 
 Sensitive findings must not be opened as public issues. Follow `SECURITY.md` and

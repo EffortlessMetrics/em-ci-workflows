@@ -29,6 +29,16 @@ on:
         required: false
         default: ''
         type: string
+      artifact_lane:
+        description: Canonical RIPR attachment lane; must be ripr when upload_artifacts is enabled
+        required: false
+        default: ''
+        type: string
+      upload_artifacts:
+        description: Return complete canonical RIPR receipts to the configured repository policy
+        required: false
+        default: false
+        type: boolean
       fetch_depth:
         description: Checkout depth; use 0 only when the proof compares Git history
         required: false
@@ -69,6 +79,8 @@ jobs:
           REQUESTED_PROFILE: ${{ inputs.profile }}
           REQUESTED_FETCH_DEPTH: ${{ inputs.fetch_depth }}
           REQUESTED_RESULT_SCRIPT: ${{ inputs.result_script }}
+          REQUESTED_UPLOAD_ARTIFACTS: ${{ inputs.upload_artifacts }}
+          REQUESTED_ARTIFACT_LANE: ${{ inputs.artifact_lane }}
           HOSTED_ENABLED: ${{ vars.EM_CI_GITHUB_HOSTED_ENABLED }}
           RUNNER_IMAGE: ${{ vars.EM_CI_RUNNER_IMAGE }}
         run: |
@@ -88,6 +100,17 @@ jobs:
               echo "::error::fetch_depth must be 0 or 1"
               exit 64
               ;;
+          esac
+
+          case "$REQUESTED_UPLOAD_ARTIFACTS" in
+            true)
+              [[ "$REQUESTED_ARTIFACT_LANE" == ripr && -n "$REQUESTED_RESULT_SCRIPT" ]] || {
+                echo '::error::RIPR transport requires artifact_lane=ripr and repository result policy'
+                exit 64
+              }
+              ;;
+            false) [[ -z "$REQUESTED_ARTIFACT_LANE" ]] || exit 64 ;;
+            *) exit 64 ;;
           esac
 
           if [[ -n "${REQUESTED_RESULT_SCRIPT:-}" ]]; then
@@ -173,6 +196,9 @@ jobs:
       proof_outcome: ${{ steps.proof.outcome }}
       proof_entered_at: ${{ steps.proof.outputs.proof_entered_at }}
       proof_run_attempt: ${{ steps.proof.outputs.proof_run_attempt }}
+      attachment_producer: ${{ steps.artifact_prepare.outputs.producer }}
+      attachment_name: ${{ steps.artifact_prepare.outputs.name }}
+      attachment_id: ${{ steps.upload_artifacts.outputs.artifact-id }}
     steps: &proof_steps
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
         with:
@@ -288,9 +314,67 @@ jobs:
           fi
           echo "CARGO_TARGET_DIR=$RUNNER_TEMP/cargo-target" >> "$GITHUB_ENV"
           echo "TMPDIR=$RUNNER_TEMP/tmp" >> "$GITHUB_ENV"
+      - name: Prepare canonical RIPR artifact root
+        id: artifact_prepare
+        if: inputs.upload_artifacts && steps.toolchain.outcome == 'success' && steps.prepare.outcome == 'success' && steps.toolchain.outputs.infrastructure_failure == '' && steps.prepare.outputs.infrastructure_failure == ''
+        shell: bash
+        env:
+          NATIVE_JOB: ${{ toJSON(job) }}
+          NATIVE_OS: ${{ runner.os }}
+          NATIVE_ARCH: ${{ runner.arch }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import json, os, pathlib, re, stat
+
+          def require(ok, message):
+              if not ok:
+                  raise ValueError(message)
+
+          def directory(path):
+              require(stat.S_ISDIR(path.lstat().st_mode), 'linked or non-directory artifact ancestor')
+
+          def prepare():
+              workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+              directory(workspace)
+              root = workspace
+              for component in ('.ci', 'artifacts', 'ripr'):
+                  root /= component
+                  try:
+                      directory(root)
+                  except FileNotFoundError:
+                      root.mkdir()
+                      directory(root)
+              require(not any(root.iterdir()), 'artifact root is not fresh and empty')
+              job = json.loads(os.environ['NATIVE_JOB'])
+              require(type(job.get('check_run_id')) is int and job['check_run_id'] > 0, 'native producer identity missing')
+              sha = job.get('workflow_sha')
+              repository = job.get('workflow_repository')
+              path = job.get('workflow_file_path')
+              require(type(sha) is str and re.fullmatch('[0-9a-f]{40}', sha), 'defining workflow SHA missing')
+              require(repository in ('EffortlessMetrics/em-ci-workflows', 'EffortlessMetrics/em-ci') and
+                      path == '.github/workflows/rust.yml' and job.get('workflow_ref') == repository + '/' + path + '@' + sha,
+                      'defining reusable workflow must use an exact full SHA')
+              require(os.environ['NATIVE_OS'] == 'Linux' and os.environ['NATIVE_ARCH'] == 'X64', 'unsupported proof platform')
+              context_path = pathlib.Path(os.environ['RUNNER_TEMP'], 'em-ci-job-context.json')
+              require(stat.S_ISREG(context_path.lstat().st_mode) and context_path.stat().st_nlink == 1, 'unsafe job context')
+              context = json.loads(context_path.read_text())
+              context.update(producer_check_run_id=job['check_run_id'], defining_workflow_ref=job['workflow_ref'],
+                             defining_workflow_sha=sha, defining_workflow_repository=repository,
+                             defining_workflow_path=path, runner_os=os.environ['NATIVE_OS'], runner_arch=os.environ['NATIVE_ARCH'])
+              context_path.write_text(json.dumps(context, sort_keys=True))
+              name = 'em-ci-rust-ripr-' + context['profile'] + '-' + str(job['check_run_id']) + '-' + context['run_id'] + '-' + context['run_attempt']
+              with open(os.environ['GITHUB_ENV'], 'a') as output:
+                  output.write('EM_CI_LANE=ripr\nEM_CI_ARTIFACT_DIR=' + str(root) + '\n')
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  output.write('name=' + name + '\nproducer=' + str(job['check_run_id']) + '\n')
+
+          if __name__ == '__main__':
+              prepare()
+          PYTHON
       - name: Run repository proof
         id: proof
-        if: steps.toolchain.outcome == 'success' && steps.prepare.outcome == 'success' && steps.toolchain.outputs.infrastructure_failure == '' && steps.prepare.outputs.infrastructure_failure == ''
+        if: steps.toolchain.outcome == 'success' && steps.prepare.outcome == 'success' && steps.toolchain.outputs.infrastructure_failure == '' && steps.prepare.outputs.infrastructure_failure == '' && (!inputs.upload_artifacts || steps.artifact_prepare.outcome == 'success')
         shell: bash
         env:
           EM_CI_PROOF_SCRIPT: ${{ inputs.script }}
@@ -351,6 +435,101 @@ jobs:
             [[ -f "$file" ]] || continue
             cp -- "$file" "$evidence_dir/$(basename "$file")"
           done
+
+      - name: Validate bounded canonical RIPR package
+        id: artifact_package
+        if: always() && !cancelled() && inputs.upload_artifacts && steps.artifact_prepare.outcome == 'success'
+        shell: bash
+        env:
+          PROOF_ENTERED_AT: ${{ steps.proof.outputs.proof_entered_at }}
+          PROOF_OUTCOME: ${{ steps.proof.outcome }}
+          PRODUCER_ID: ${{ steps.artifact_prepare.outputs.producer }}
+          ARTIFACT_NAME: ${{ steps.artifact_prepare.outputs.name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import datetime, json, os, pathlib, stat
+
+          MAX_FILES = 512
+          MAX_BYTES = 8 * 1024**3
+          MANDATORY = (
+              'target/ripr/pr/raw-check.json', 'target/ripr/pr/repo-exposure.json',
+              'target/ripr/review/comments.json', 'target/receipts/quality/ripr-plus.json',
+              'target/receipts/quality/quality-gate-ripr.json', 'target/receipts/quality/quality-gate-ripr.md',
+              'target/xtask/impacted-evidence/latest.json', 'target/xtask/impacted-evidence/latest.md',
+              'ripr-tool-identity.txt', 'ripr-cgroup-memory.txt',
+          )
+
+          def require(ok, message):
+              if not ok:
+                  raise ValueError(message)
+
+          def package():
+              # Typed pre-entry withdrawal preserves existing recovery eligibility. It
+              # neither uploads diagnostics nor makes an absent proof successful.
+              if os.environ.get('PROOF_ENTERED_AT', '') == '':
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                      output.write('upload=false\n')
+                  return
+              workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+              root = workspace / '.ci/artifacts/ripr'
+              for path in (workspace, workspace / '.ci', workspace / '.ci/artifacts', root):
+                  require(stat.S_ISDIR(path.lstat().st_mode), 'unsafe artifact ancestor')
+              paths = []
+              total = 0
+              start = datetime.datetime.strptime(os.environ['PROOF_ENTERED_AT'], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc).timestamp()
+              def traversal_error(error):
+                  raise error
+              for walked, children, files in os.walk(root, followlinks=False, onerror=traversal_error):
+                  walked = pathlib.Path(walked)
+                  for name in children + files:
+                      path = walked / name
+                      relative = path.relative_to(root).as_posix()
+                      require(not name.startswith('.') and 'staging' not in name.lower() and
+                              len(relative.encode('utf-8')) <= 256 and
+                              all(ord(char) >= 32 and char not in '\\:' for char in relative), 'unsafe artifact member')
+                      info = path.lstat()
+                      if name in children:
+                          require(stat.S_ISDIR(info.st_mode), 'linked artifact directory')
+                          continue
+                      require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_mtime >= start,
+                              'nonregular, linked or stale artifact member')
+                      require(relative != 'em-ci-job-context.json', 'reserved artifact context')
+                      total += info.st_size
+                      paths.append(relative)
+                      require(len(paths) < MAX_FILES and total <= MAX_BYTES, 'proof package exceeds bound')
+              require(paths and total > 0, 'missing current proof diagnostics')
+              context_path = pathlib.Path(os.environ['RUNNER_TEMP'], 'em-ci-job-context.json')
+              info = context_path.lstat()
+              require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and 0 < info.st_size <= 65536, 'unsafe finalized context')
+              context = json.loads(context_path.read_text())
+              require(context.get('proof_started_at') == os.environ['PROOF_ENTERED_AT'] and
+                      context.get('producer_check_run_id') == int(os.environ['PRODUCER_ID']) and
+                      context.get('run_attempt') == os.environ['GITHUB_RUN_ATTEMPT'], 'context identity changed')
+              if os.environ['PROOF_OUTCOME'] == 'success':
+                  require(context.get('job_status') == 'success', 'producer has no successful finalized context')
+                  require(all(name in paths and (root / name).stat().st_size > 0 for name in MANDATORY), 'mandatory canonical RIPR receipt missing')
+              context.update(lane='ripr', artifact_name=os.environ['ARTIFACT_NAME'], file_count=len(paths), total_bytes=total)
+              raw = json.dumps(context, sort_keys=True).encode('utf-8')
+              require(len(raw) <= 65536 and total + len(raw) <= MAX_BYTES, 'context-inclusive package exceeds bound')
+              with (root / 'em-ci-job-context.json').open('xb') as output:
+                  output.write(raw)
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  output.write('upload=true\n')
+
+          if __name__ == '__main__':
+              package()
+          PYTHON
+      - name: Upload bounded canonical RIPR receipts
+        id: upload_artifacts
+        if: always() && !cancelled() && inputs.upload_artifacts && steps.artifact_package.outputs.upload == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ${{ steps.artifact_prepare.outputs.name }}
+          path: ${{ github.workspace }}/.ci/artifacts/ripr
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
 
   standard:
     name: Rust standard
@@ -591,6 +770,341 @@ jobs:
             echo "::error::selected proof did not succeed: $selected"
             exit 1
           }
+      - name: Authenticate and import canonical RIPR receipts
+        id: import_receipts
+        if: inputs.upload_artifacts && steps.evaluate.outcome == 'success'
+        shell: bash
+        env:
+          CANONICAL_RIPR_PATHS: '["target/ripr/pr/raw-check.json","target/ripr/pr/repo-exposure.json","target/ripr/review/comments.json","target/receipts/quality/ripr-plus.json","target/receipts/quality/quality-gate-ripr.json","target/receipts/quality/quality-gate-ripr.md","target/xtask/impacted-evidence/latest.json","target/xtask/impacted-evidence/latest.md","ripr-tool-identity.txt","ripr-cgroup-memory.txt"]'
+          GH_TOKEN: ${{ github.token }}
+          NATIVE_JOB: ${{ toJSON(job) }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          EM_CI_EVIDENCE: ${{ steps.evaluate.outputs.evidence }}
+          SUBJECT_REPOSITORY: ${{ github.repository }}
+          SUBJECT_SHA: ${{ github.sha }}
+          SUBJECT_RUN_ID: ${{ github.run_id }}
+          SUBJECT_RUN_ATTEMPT: ${{ github.run_attempt }}
+          SUBJECT_PROFILE: ${{ needs.classify.outputs.profile }}
+          SUBJECT_EVENT: ${{ github.event_name }}
+          SUBJECT_REF: ${{ github.ref }}
+          SUBJECT_WORKFLOW: ${{ github.workflow }}
+          SUBJECT_WORKFLOW_REF: ${{ github.workflow_ref }}
+          SUBJECT_PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          SUBJECT_PR_HEAD: ${{ github.event.pull_request.head.sha || '' }}
+          SUBJECT_PR_BASE: ${{ github.event.pull_request.base.sha || '' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import datetime, hashlib, json, os, pathlib, re, stat, struct, time
+          import urllib.error, urllib.parse, urllib.request, zipfile
+
+          MAX_FILES = 512
+          MAX_BYTES = 8 * 1024**3
+          MAX_ARCHIVE = MAX_BYTES + 1024**2
+          MANDATORY = tuple(json.loads(os.environ['CANONICAL_RIPR_PATHS']))
+          CLOCK_SKEW = datetime.timedelta(seconds=2)
+
+          def require(ok, message):
+              if not ok:
+                  raise ValueError(message)
+
+          def positive(value):
+              return type(value) is int and value > 0
+
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  require(key not in result, 'duplicate JSON field')
+                  result[key] = value
+              return result
+
+          def document(raw, maximum=2_000_000):
+              require(0 < len(raw) <= maximum, 'JSON document outside bound')
+              return json.loads(raw.decode('utf-8'), object_pairs_hook=unique_object)
+
+          def instant(value):
+              require(type(value) is str and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?(?:Z|[+-]\d\d:\d\d)', value), 'invalid timestamp')
+              return datetime.datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(datetime.timezone.utc)
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          class GitHub:
+              def __init__(self, repository, token):
+                  require(type(repository) is str and re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository) and token, 'missing API identity')
+                  self.repository, self.token = repository, token
+                  self.opener = urllib.request.build_opener(NoRedirect)
+
+              def request(self, path):
+                  require(path.startswith('actions/') or path.startswith('check-runs/') or path.startswith('git/commits/') or path.startswith('pulls/'), 'unsupported API path')
+                  return urllib.request.Request('https://api.github.com/repos/' + self.repository + '/' + path,
+                      headers={'Authorization': 'Bearer ' + self.token, 'Accept': 'application/vnd.github+json',
+                               'X-GitHub-Api-Version': '2026-03-10'})
+
+              def get(self, path):
+                  with self.opener.open(self.request(path), timeout=30) as response:
+                      require(response.status == 200, 'API read not successful')
+                      return document(response.read(2_000_001))
+
+              def collection(self, path, field):
+                  items, total = [], None
+                  for page in range(1, 11):
+                      separator = '&' if '?' in path else '?'
+                      body = self.get(path + separator + 'per_page=100&page=' + str(page))
+                      count, part = body.get('total_count'), body.get(field)
+                      require(type(count) is int and 0 <= count <= 1000 and type(part) is list and len(part) <= 100, 'invalid collection')
+                      require(total is None or count == total, 'collection changed during pagination')
+                      total = count
+                      items.extend(part)
+                      require(len(items) <= total and all(type(item) is dict and positive(item.get('id')) for item in items), 'invalid collection identities')
+                      require(len({item['id'] for item in items}) == len(items), 'duplicate collection identity')
+                      if len(items) == total:
+                          return items
+                      require(len(part) == 100, 'incomplete collection page')
+                  raise ValueError('incomplete collection')
+
+              def download(self, artifact, destination):
+                  require(positive(artifact.get('id')) and type(artifact.get('size_in_bytes')) is int and
+                          0 < artifact['size_in_bytes'] <= MAX_ARCHIVE and
+                          type(artifact.get('digest')) is str and re.fullmatch(r'sha256:[0-9a-f]{64}', artifact['digest']), 'invalid archive metadata')
+                  try:
+                      with self.opener.open(self.request('actions/artifacts/' + str(artifact['id']) + '/zip'), timeout=30):
+                          raise ValueError('missing download redirect')
+                  except urllib.error.HTTPError as response:
+                      require(response.code == 302, 'missing download redirect')
+                      location = response.headers.get('Location', '')
+                  parsed = urllib.parse.urlsplit(location)
+                  require(len(location) <= 4096 and parsed.scheme == 'https' and parsed.hostname and
+                          parsed.port in (None, 443) and not parsed.username and not parsed.password and not parsed.fragment and
+                          all(ord(char) >= 32 for char in location), 'unsafe download location')
+                  # Signed request carries no token or redirects.
+                  count, digest, deadline = 0, hashlib.sha256(), time.monotonic() + 1200
+                  with self.opener.open(urllib.request.Request(location), timeout=30) as response, destination.open('xb') as output:
+                      require(response.status == 200, 'signed download unsuccessful')
+                      while True:
+                          require(time.monotonic() < deadline, 'archive download timeout')
+                          block = response.read(1024**2)
+                          if not block:
+                              break
+                          count += len(block)
+                          require(count <= MAX_ARCHIVE and count <= artifact['size_in_bytes'], 'archive too large')
+                          digest.update(block)
+                          output.write(block)
+                  require(count == artifact['size_in_bytes'] and 'sha256:' + digest.hexdigest() == artifact['digest'], 'archive digest/size mismatch')
+
+          def zip_directory_bound(path):
+              with path.open('rb') as stream:
+                  size = path.stat().st_size
+                  require(22 <= size <= MAX_ARCHIVE, 'archive outside bound')
+                  stream.seek(max(0, size - 65557))
+                  tail = stream.read(65557)
+                  end = tail.rfind(b'PK\x05\x06')
+                  require(end >= 0 and len(tail) - end >= 22, 'missing ZIP end')
+                  _, disk, directory_disk, disk_count, count, length, offset, comment = struct.unpack('<4s4H2LH', tail[end:end + 22])
+                  require(end + 22 + comment == len(tail) and disk == directory_disk == 0 and disk_count == count, 'split or malformed ZIP')
+                  end_offset = size - len(tail) + end
+                  sentinel = count == 65535 or length == 0xffffffff or offset == 0xffffffff
+                  locator = b''
+                  if end_offset >= 20:
+                      stream.seek(end_offset - 20)
+                      locator = stream.read(20)
+                  has_zip64 = locator.startswith(b'PK\x06\x07')
+                  require(not sentinel or has_zip64, 'ZIP64 locator missing')
+                  directory_end = end_offset
+                  if has_zip64:
+                      # Honor ZIP64 locators without classic sentinels.
+                      signature, record_disk, record_offset, disks = struct.unpack('<4sLQL', locator)
+                      require(record_disk == 0 and disks == 1 and record_offset == end_offset - 76,
+                              'invalid ZIP64 locator')
+                      stream.seek(record_offset)
+                      data = stream.read(56)
+                      require(len(data) == 56, 'truncated ZIP64 record')
+                      signature, record_length, _, _, disk, directory_disk, disk_count, count, length, offset = struct.unpack('<4sQ2H2L4Q', data)
+                      require(signature == b'PK\x06\x06' and record_length == 44 and disk == directory_disk == 0 and disk_count == count,
+                              'invalid or extensible ZIP64 directory')
+                      directory_end = record_offset
+                  require(0 < count <= MAX_FILES and 0 < length <= 1024**2 and 0 <= offset and offset + length == directory_end,
+                          'ZIP metadata exceeds bounds/extent')
+                  stream.seek(0)
+                  require(stream.read(4) == b'PK\x03\x04', 'ZIP prefix is not a file header')
+                  return count
+
+          def unpack(archive, destination):
+              require(not destination.exists() and not destination.is_symlink(), 'import root already exists')
+              count = zip_directory_bound(archive)
+              destination.mkdir()
+              require(stat.S_ISDIR(destination.lstat().st_mode), 'unsafe import root')
+              total, names = 0, set()
+              with zipfile.ZipFile(archive) as zipped:
+                  require(len(zipped.infolist()) == count, 'ZIP member count mismatch')
+                  for member in zipped.infolist():
+                      name = member.filename
+                      parts = name.split('/')
+                      require(member.orig_filename == name and len(name.encode('utf-8')) <= 256 and
+                              all(part and part not in ('.', '..') and not part.startswith('.') and 'staging' not in part.lower() for part in parts) and
+                              all(ord(char) >= 32 and char not in '\\:' for char in name), 'unsafe ZIP member path')
+                      require(not member.is_dir() and not member.flag_bits & 1 and
+                              stat.S_IFMT(member.external_attr >> 16) in (0, stat.S_IFREG), 'encrypted or nonregular ZIP member')
+                      require(name not in names and 0 <= member.file_size <= MAX_BYTES - total, 'duplicate or oversized ZIP member')
+                      names.add(name)
+                      target = destination.joinpath(*parts)
+                      parent = destination
+                      for part in parts[:-1]:
+                          parent /= part
+                          if not parent.exists():
+                              parent.mkdir()
+                          require(stat.S_ISDIR(parent.lstat().st_mode), 'unsafe extraction ancestor')
+                      actual = 0
+                      with zipped.open(member) as source, target.open('xb') as output:
+                          while True:
+                              block = source.read(min(1024**2, MAX_BYTES - total + 1))
+                              if not block:
+                                  break
+                              actual += len(block)
+                              total += len(block)
+                              require(total <= MAX_BYTES and actual <= member.file_size, 'expanded archive exceeds bound')
+                              output.write(block)
+                      require(actual == member.file_size and stat.S_ISREG(target.lstat().st_mode), 'truncated ZIP member')
+              require('em-ci-job-context.json' in names and all(name in names and (destination / name).stat().st_size > 0 for name in MANDATORY),
+                      'missing canonical RIPR evidence')
+              context_path = destination / 'em-ci-job-context.json'
+              require(context_path.stat().st_size <= 65536, 'context exceeds bound')
+              context = document(context_path.read_bytes(), 65536)
+              require(type(context.get('file_count')) is int and context['file_count'] == len(names) - 1 and
+                      type(context.get('total_bytes')) is int and context['total_bytes'] == total - context_path.stat().st_size,
+                      'context count mismatch')
+              return context
+
+          def native_job(jobs, check_id, repository, attempt):
+              url = 'https://api.github.com/repos/' + repository + '/check-runs/' + str(check_id)
+              matches = [job for job in jobs if job.get('check_run_url') == url]
+              require(positive(check_id) and len(matches) == 1 and positive(matches[0].get('id')) and
+                      type(matches[0].get('run_attempt')) is int and matches[0]['run_attempt'] == attempt, 'producer absent or ambiguous')
+              return matches[0]
+
+          def import_proof(api, subject, evidence, needs, defining, temporary):
+              repository, run_id, attempt = subject['repository'], int(subject['run_id']), int(subject['run_attempt'])
+              require(run_id > 0 and attempt > 0 and re.fullmatch('[0-9a-f]{40}', subject['sha']), 'invalid selected subject')
+              key = subject['profile'] if evidence['route'] == 'self_hosted' else {'hosted': 'hosted', 'hosted_fallback': 'hosted-fallback'}.get(evidence['route'])
+              require(evidence.get('schema') == 'em-ci-rust-result.v1' and key in needs and needs[key]['result'] == 'success' and evidence['result'] == evidence['proof_outcome'] == 'success' and
+                      all(evidence[k] == subject[k] for k in ('repository', 'sha', 'run_id', 'run_attempt', 'profile')), 'selected proof mismatch/failure')
+              selected = needs[key]['outputs']
+              require(selected.get('proof_run_attempt') == subject['run_attempt'] and selected.get('proof_entered_at') == evidence['proof_entered_at'], 'cached proof attempt')
+              require(all(type(selected.get(field)) is str and re.fullmatch('[1-9][0-9]*', selected[field])
+                          for field in ('attachment_producer', 'attachment_id')), 'missing attachment identity')
+              producer_id, artifact_id = int(selected['attachment_producer']), int(selected['attachment_id'])
+              name = 'em-ci-rust-ripr-' + subject['profile'] + '-' + str(producer_id) + '-' + subject['run_id'] + '-' + subject['run_attempt']
+              require(selected['attachment_name'] == name, 'wrong selected artifact name')
+              run_path = 'actions/runs/' + str(run_id) + '/attempts/' + str(attempt)
+              latest = api.get('actions/runs/' + str(run_id))
+              require(positive(latest.get('id')) and latest['id'] == run_id and type(latest.get('run_attempt')) is int and
+                      latest['run_attempt'] == attempt, 'stale run attempt')
+              run = api.get(run_path)
+              base, head = run['repository'], run['head_repository']
+              require(positive(run.get('id')) and run.get('id') == run_id and type(run.get('run_attempt')) is int and run['run_attempt'] == attempt and
+                      run.get('event') == subject['event'] and base['full_name'] == repository and
+                      positive(base['id']) and positive(head['id']), 'native run subject mismatch')
+              native_head = subject['pr_head'] if subject['event'] == 'pull_request' else subject['sha']
+              require(run['head_sha'] == native_head, 'native head mismatch')
+              if subject['event'] == 'pull_request':
+                  require(re.fullmatch('[1-9][0-9]*', subject['pr_number']) and
+                          subject['ref'] == 'refs/pull/' + subject['pr_number'] + '/merge', 'invalid PR event identity')
+                  # Bind PR directly; associations may be empty and the event base is fixed.
+                  pull = api.get('pulls/' + subject['pr_number'])
+                  require(positive(pull.get('number')) and str(pull['number']) == subject['pr_number'] and
+                          pull['head']['sha'] == subject['pr_head'] and
+                          pull['base']['repo']['full_name'] == repository and pull['base']['repo']['id'] == base['id'] and
+                          all(pull['head']['repo'][k] == head[k] for k in ('id', 'full_name')),
+                          'native PR model mismatch')
+                  associations = run.get('pull_requests', [])
+                  require(type(associations) is list, 'invalid native PR associations')
+                  matching = [item for item in associations if str(item['number']) == subject['pr_number']]
+                  require(len(matching) <= 1 and (not matching or matching[0]['head']['sha'] == subject['pr_head']),
+                          'contradictory native PR association')
+                  commit = api.get('git/commits/' + subject['sha'])
+                  require(commit['sha'] == subject['sha'] and [p['sha'] for p in commit['parents']] == [subject['pr_base'], subject['pr_head']],
+                          'evaluated PR merge is not the exact event join')
+              require((head['full_name'] == repository and head['id'] == base['id']) or
+                      (subject['event'] == 'pull_request' and key == 'hosted'), 'wrong source repository/route')
+              sha, workflow_repository, workflow_path = defining['workflow_sha'], defining['workflow_repository'], defining['workflow_file_path']
+              require(re.fullmatch('[0-9a-f]{40}', sha) and workflow_repository in ('EffortlessMetrics/em-ci-workflows', 'EffortlessMetrics/em-ci') and
+                      workflow_path == '.github/workflows/rust.yml' and defining['workflow_ref'] == workflow_repository + '/' + workflow_path + '@' + sha,
+                      'defining workflow mismatch')
+              references = [item for item in run.get('referenced_workflows', []) if item.get('path') == defining['workflow_ref'] and item.get('sha') == sha]
+              require(len(references) == 1, 'workflow absent or ambiguous')
+              jobs = api.collection(run_path + '/jobs', 'jobs')
+              producer = native_job(jobs, producer_id, repository, attempt)
+              policy = native_job(jobs, defining['check_run_id'], repository, attempt)
+              require(positive(producer.get('run_id')) and producer['run_id'] == run_id and
+                      positive(policy.get('run_id')) and policy['run_id'] == run_id, 'wrong native job run')
+              suffix = ' / Rust repository result policy'
+              require(policy['name'].endswith(suffix), 'wrong native policy job')
+              prefix = policy['name'][:-len(suffix)]
+              title = 'Rust hosted external' if key == 'hosted' else 'Rust hosted pre-proof recovery' if key == 'hosted-fallback' else 'Rust ' + key
+              require(producer['name'] == prefix + ' / ' + title and producer.get('status') == 'completed' and
+                      producer.get('conclusion') == 'success' and producer['head_sha'] == native_head, 'wrong call instance or failed producer')
+              if evidence['route'] == 'self_hosted':
+                  labels = producer.get('labels')
+                  require(type(labels) is list and all(type(label) is str for label in labels) and
+                          {'self-hosted', 'linux', 'x64', 'rust-' + subject['profile']}.issubset(labels) and
+                          not {'windows', 'arm64', 'macOS'}.intersection(labels) and
+                          producer.get('runner_group_name') == 'em-ci-build' and positive(producer.get('runner_group_id')),
+                          'producer route/platform mismatch')
+              check = api.get('check-runs/' + str(producer_id))
+              require(check.get('id') == producer_id and check.get('app', {}).get('id') == 15368 and check.get('status') == 'completed' and
+                      check.get('conclusion') == 'success' and check.get('head_sha') == native_head, 'producer check failed')
+              steps = [step for step in producer['steps'] if step['name'] == 'Run repository proof']
+              require(len(steps) == 1 and steps[0]['conclusion'] == 'success', 'proof step absent/failed')
+              artifacts_path = 'actions/runs/' + str(run_id) + '/artifacts?name=' + urllib.parse.quote(name, safe='')
+              artifacts = api.collection(artifacts_path, 'artifacts')
+              matches = [item for item in artifacts if item.get('name') == name]
+              require(len(matches) == 1 and matches[0]['id'] == artifact_id, 'attachment identity mismatch')
+              artifact = matches[0]
+              native = artifact.get('workflow_run', {})
+              require(artifact.get('expired') is False and native.get('id') == run_id and native.get('head_sha') == native_head and
+                      native.get('repository_id') == base['id'] and native.get('head_repository_id') == head['id'],
+                      'artifact native subject mismatch')
+              require(instant(producer['started_at']) <= instant(artifact['created_at']) <= instant(artifact['updated_at']) <= instant(producer['completed_at']),
+                      'attachment outside producer lifetime')
+              again = api.collection(artifacts_path, 'artifacts')
+              require([item for item in again if item.get('name') == name] == [artifact], 'artifact collection changed')
+              require(stat.S_ISDIR(temporary.lstat().st_mode) and not (temporary / 'em-ci-ripr-import').exists(), 'unsafe or stale import workspace')
+              directory = temporary / 'em-ci-ripr-import'
+              directory.mkdir()
+              archive = directory / 'proof.zip'
+              api.download(artifact, archive)
+              context = unpack(archive, directory / 'receipts')
+              expected = {k: subject[k] for k in ('repository', 'workflow_ref', 'workflow', 'run_id',
+                  'run_attempt', 'event', 'ref', 'sha', 'profile')}
+              expected.update(schema='em-ci-job-context.v1', job=key,
+                  self_hosted=evidence['route'] == 'self_hosted', proof_started_at=evidence['proof_entered_at'],
+                  job_status='success', lane='ripr', artifact_name=name, producer_check_run_id=producer_id,
+                  defining_workflow_ref=defining['workflow_ref'], defining_workflow_sha=sha,
+                  defining_workflow_repository=workflow_repository, defining_workflow_path=workflow_path,
+                  runner_os='Linux', runner_arch='X64')
+              require(set(context) == set(expected) | {'admission_recorded_at', 'proof_finished_at', 'file_count', 'total_bytes'} and
+                      all(type(context.get(k)) is type(v) and context[k] == v for k, v in expected.items()), 'context mismatch')
+              local = [instant(context[k]) for k in ('admission_recorded_at', 'proof_started_at', 'proof_finished_at')]
+              native = [instant(producer['started_at']), instant(steps[0]['started_at']),
+                        instant(steps[0]['completed_at']), instant(artifact['created_at'])]
+              require(sorted(native) == native and sorted(local) == local and
+                      all(start - CLOCK_SKEW <= value <= end + CLOCK_SKEW
+                          for value, start, end in zip(local, native, native[1:])), 'invalid proof generation timing')
+              return directory / 'receipts'
+
+          def main():
+              subject = {key: os.environ['SUBJECT_' + key.upper()] for key in
+                  ('repository', 'sha', 'run_id', 'run_attempt', 'profile', 'event', 'ref', 'workflow', 'workflow_ref', 'pr_number', 'pr_head', 'pr_base')}
+              directory = import_proof(GitHub(subject['repository'], os.environ['GH_TOKEN']), subject,
+                  document(os.environ['EM_CI_EVIDENCE'].encode()), document(os.environ['NEEDS_JSON'].encode()),
+                  document(os.environ['NATIVE_JOB'].encode()), pathlib.Path(os.environ['RUNNER_TEMP']))
+              with open(os.environ['GITHUB_ENV'], 'a') as output:
+                  output.write('EM_CI_ARTIFACT_DIR=' + str(directory) + '\nEM_CI_LANE=ripr\n')
+
+          if __name__ == '__main__':
+              main()
+          PYTHON
       - name: Checkout exact result-policy source
         if: inputs.result_script != '' && steps.evaluate.outcome == 'success'
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
@@ -599,7 +1113,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
       - name: Run repository result policy
-        if: inputs.result_script != '' && steps.evaluate.outcome == 'success'
+        if: inputs.result_script != '' && steps.evaluate.outcome == 'success' && (!inputs.upload_artifacts || steps.import_receipts.outcome == 'success')
         env:
           EM_CI_RESULT_SCRIPT: ${{ inputs.result_script }}
           EM_CI_EVIDENCE: ${{ steps.evaluate.outputs.evidence }}
