@@ -11,6 +11,11 @@ reusable workflow by full commit SHA.
 ## Rust consumer
 
 ```yaml
+permissions:
+  contents: read
+  checks: read
+  actions: read
+  pull-requests: read
 jobs:
   ci:
     uses: EffortlessMetrics/em-ci-workflows/.github/workflows/rust.yml@FULL_COMMIT_SHA
@@ -19,6 +24,21 @@ jobs:
       script: .ci/run.sh
       fetch_depth: 1
 ```
+
+Rust control/result jobs use the owned `rust-standard` pool on the normal path.
+GitHub performs native queueing; no hosted observer waits for owned capacity.
+An explicit enabled hosted selection and the existing typed pre-proof recovery
+can select hosted execution. Queueing alone does not promote work to hosted.
+
+An optional `result_script` runs in the existing final job after exact proof
+validation, from a credential-free checkout of the same event SHA. It receives
+`EM_CI_EVIDENCE` and `EM_CI_SELECTED_PROOF_RESULT`; its failure fails the reusable
+call. It has the read scopes above, never a write token or inherited secrets.
+Callers must require the complete reusable call to succeed, not only inspect the
+selected-proof envelope. The final job also publishes that envelope and exposes
+its collision-resistant artifact name as `receipt_name`; no separate receipt
+runner is needed. Any required-check migration must retain the complete
+repository result policy and be qualified before changing the binding.
 
 ## Python consumer
 
@@ -90,9 +110,12 @@ weight, so one active job can use idle capacity while two active jobs share the
 machine. Memory, no-swap, disk, inodes, PIDs, language-specific parallelism, and
 simultaneous slot count remain independent boundaries.
 
-The workflows' pure control jobs (`classify`, `external-unavailable`, and `result`) execute
-on GitHub-hosted Ubuntu using only full-SHA-pinned workflow source. They do not check
-out caller-controlled source or receive repository secrets.
+Rust classification and refusal jobs execute only immutable workflow code, with
+no caller checkout. The Rust result job optionally executes the explicitly chosen
+repository result policy after exact proof validation, with read-only access.
+Its normal-path controls and receipt run on owned standard capacity. Python's
+existing pure control jobs still use GitHub-hosted Ubuntu and do not check out
+caller-controlled source or receive repository secrets.
 
 Trusted proofs normally run on the requested self-hosted language capability.
 When hosted execution is enabled, Rust callers may request `force_hosted: true`.
