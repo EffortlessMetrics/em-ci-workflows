@@ -30,15 +30,20 @@ on:
         default: ''
         type: string
       artifact_lane:
-        description: Canonical RIPR attachment lane; must be ripr when upload_artifacts is enabled
+        description: "Closed artifact lane: ripr or failure-diagnostics; empty when disabled"
         required: false
         default: ''
         type: string
       upload_artifacts:
-        description: Return complete canonical RIPR receipts to the configured repository policy
+        description: Opt in to the selected bounded artifact lane
         required: false
         default: false
         type: boolean
+      proof_admission:
+        description: Optional closed native-review-v1 recheck after allocation and before proof
+        required: false
+        default: ''
+        type: string
       fetch_depth:
         description: Checkout depth; use 0 only when the proof compares Git history
         required: false
@@ -78,6 +83,7 @@ jobs:
           REQUESTED_FORCE_HOSTED: ${{ inputs.force_hosted }}
           REQUESTED_PROFILE: ${{ inputs.profile }}
           REQUESTED_FETCH_DEPTH: ${{ inputs.fetch_depth }}
+          REQUESTED_PROOF_ADMISSION: ${{ inputs.proof_admission }}
           REQUESTED_RESULT_SCRIPT: ${{ inputs.result_script }}
           REQUESTED_UPLOAD_ARTIFACTS: ${{ inputs.upload_artifacts }}
           REQUESTED_ARTIFACT_LANE: ${{ inputs.artifact_lane }}
@@ -102,12 +108,21 @@ jobs:
               ;;
           esac
 
+          case "${REQUESTED_PROOF_ADMISSION:-}" in
+            '') ;;
+            native-review-v1)
+              [[ "$GITHUB_EVENT_NAME" == pull_request && "$REQUESTED_FETCH_DEPTH" == 0 ]] || exit 64
+              ;;
+            *) exit 64 ;;
+          esac
+
           case "$REQUESTED_UPLOAD_ARTIFACTS" in
             true)
-              [[ "$REQUESTED_ARTIFACT_LANE" == ripr && -n "$REQUESTED_RESULT_SCRIPT" ]] || {
-                echo '::error::RIPR transport requires artifact_lane=ripr and repository result policy'
-                exit 64
-              }
+              case "$REQUESTED_ARTIFACT_LANE" in
+                ripr) [[ -n "$REQUESTED_RESULT_SCRIPT" ]] || exit 64 ;;
+                failure-diagnostics) [[ -z "$REQUESTED_RESULT_SCRIPT" ]] || exit 64 ;;
+                *) exit 64 ;;
+              esac
               ;;
             false) [[ -z "$REQUESTED_ARTIFACT_LANE" ]] || exit 64 ;;
             *) exit 64 ;;
@@ -182,6 +197,11 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   light:
+    permissions: &proof_permissions
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
     name: Rust light
     needs: classify
     if: needs.classify.outputs.self_hosted == 'true' && needs.classify.outputs.profile == 'light'
@@ -201,6 +221,7 @@ jobs:
       attachment_id: ${{ steps.upload_artifacts.outputs.artifact-id }}
     steps: &proof_steps
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        id: checkout
         with:
           persist-credentials: false
           fetch-depth: ${{ inputs.fetch_depth }}
@@ -231,7 +252,7 @@ jobs:
           fi
           if [[ -n "$toolchain_file" ]]; then
             if grep -Eq '^[[:space:]]*\[' "$toolchain_file"; then
-              requested=$(python3 - "$toolchain_file" <<'PY'
+              requested=$(python3 -I - "$toolchain_file" <<'PY'
           import pathlib
           import sys
           import tomllib
@@ -316,7 +337,7 @@ jobs:
           echo "TMPDIR=$RUNNER_TEMP/tmp" >> "$GITHUB_ENV"
       - name: Prepare canonical RIPR artifact root
         id: artifact_prepare
-        if: inputs.upload_artifacts && steps.toolchain.outcome == 'success' && steps.prepare.outcome == 'success' && steps.toolchain.outputs.infrastructure_failure == '' && steps.prepare.outputs.infrastructure_failure == ''
+        if: inputs.upload_artifacts && inputs.artifact_lane == 'ripr' && steps.toolchain.outcome == 'success' && steps.prepare.outcome == 'success' && steps.toolchain.outputs.infrastructure_failure == '' && steps.prepare.outputs.infrastructure_failure == ''
         shell: bash
         env:
           NATIVE_JOB: ${{ toJSON(job) }}
@@ -324,7 +345,7 @@ jobs:
           NATIVE_ARCH: ${{ runner.arch }}
         run: |
           set -euo pipefail
-          python3 - <<'PYTHON'
+          python3 -I - <<'PYTHON'
           import json, os, pathlib, re, stat
 
           def require(ok, message):
@@ -372,9 +393,289 @@ jobs:
           if __name__ == '__main__':
               prepare()
           PYTHON
+      - name: Recheck native proof admission
+        id: admission
+        if: always() && !cancelled() && inputs.proof_admission == 'native-review-v1' && steps.checkout.outcome == 'success'
+        timeout-minutes: 5
+        shell: bash
+        env:
+          EM_CI_ADMISSION_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PYTHON'
+          import datetime as dt, hashlib, json, os, pathlib, re, shutil, signal, stat, subprocess, tempfile, time, urllib.request
+
+          REPOSITORIES = ('EffortlessMetrics/perl-lsp-swarm', 'EffortlessMetrics/unsafe-review-swarm')
+          OWNERS = ('scripts/ci/check-pr-semantic-review-currentness.py',
+                    'scripts/ci/check-pr-review-convergence', 'scripts/ci/check-pr-review-convergence-core')
+          SHA = re.compile('[0-9a-f]{40}')
+          COORDINATOR = 'EffortlessSteven'
+
+
+          def require(ok):
+              if not ok:
+                  raise ValueError('native proof admission refused')
+
+
+          def pairs(rows):
+              value = {}
+              for key, item in rows:
+                  require(key not in value)
+                  value[key] = item
+              return value
+
+
+          def decode(raw):
+              return json.loads(raw, object_pairs_hook=pairs, parse_constant=lambda value: require(False))
+
+
+          def stamp(value):
+              return dt.datetime.strptime(value, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=dt.timezone.utc)
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  raise ValueError('native metadata redirect refused')
+
+
+          class API:
+              def __init__(self, token):
+                  require(type(token) is str and token and '\n' not in token and '\r' not in token)
+                  self.token, self.calls, self.bytes = token, 0, 0
+                  self.opener = urllib.request.build_opener(NoRedirect)
+
+              def request(self, path, payload=None):
+                  self.calls += 1
+                  require(self.calls <= 40 and path.startswith(('/repos/', '/graphql')) and '..' not in path)
+                  data = None if payload is None else json.dumps(payload).encode()
+                  request = urllib.request.Request('https://api.github.com' + path, data=data, headers={
+                      'Authorization': 'Bearer ' + self.token, 'Accept': 'application/vnd.github+json',
+                      'X-GitHub-Api-Version': '2022-11-28', 'Content-Type': 'application/json'})
+                  with self.opener.open(request, timeout=10) as response:
+                      require(response.status == 200)
+                      raw = response.read(1024**2 + 1)
+                  self.bytes += len(raw)
+                  require(len(raw) <= 1024**2 and self.bytes <= 16 * 1024**2)
+                  value = decode(raw)
+                  require(not (type(value) is dict and value.get('errors')))
+                  return value
+
+              def reviews(self, prefix):
+                  result = []
+                  for page in range(1, 6):
+                      batch = self.request(prefix + '/reviews?per_page=100&page=' + str(page))
+                      require(type(batch) is list)
+                      result.extend(batch)
+                      if len(batch) < 100:
+                          return result
+                  raise ValueError('review inventory exceeds bound')
+
+              def auto_merge(self, repository, pr):
+                  owner, repo = repository.split('/')
+                  query = '''query($owner:String!,$repo:String!,$pr:Int!) {
+                    repository(owner:$owner,name:$repo) { pullRequest(number:$pr) {
+                      autoMergeRequest { enabledAt enabledBy { login __typename } mergeMethod } } } }'''
+                  value = self.request('/graphql', dict(query=query, variables=dict(owner=owner, repo=repo, pr=pr)))
+                  return value['data']['repository']['pullRequest']['autoMergeRequest']
+
+              def threads(self, repository, pr):
+                  owner, repo = repository.split('/')
+                  query = '''query($owner:String!,$repo:String!,$pr:Int!,$after:String) {
+                    repository(owner:$owner,name:$repo) { pullRequest(number:$pr) {
+                      reviewThreads(first:100,after:$after) { nodes { id isResolved isOutdated comments(first:1) { totalCount } }
+                        pageInfo { hasNextPage endCursor } } } } }'''
+                  result, cursor = [], None
+                  for _ in range(5):
+                      value = self.request('/graphql', dict(query=query, variables=dict(owner=owner, repo=repo, pr=pr, after=cursor)))
+                      connection = value['data']['repository']['pullRequest']['reviewThreads']
+                      require(type(connection['nodes']) is list and type(connection['pageInfo']['hasNextPage']) is bool)
+                      for thread in connection['nodes']:
+                          require(thread['isResolved'] is True)
+                      result.extend(connection['nodes'])
+                      if not connection['pageInfo']['hasNextPage']:
+                          return result
+                      next_cursor = connection['pageInfo']['endCursor']
+                      require(type(next_cursor) is str and next_cursor and next_cursor != cursor)
+                      cursor = next_cursor
+                  raise ValueError('thread inventory exceeds bound')
+
+
+          def record(body):
+              require(type(body) is str and len(body.encode('utf-8')) <= 65536)
+              matches = re.findall(r'<!-- unsafe-review-admission-v1: (\{[^\n]*\}) -->', body)
+              require(len(matches) == 1 and body.count('<!-- unsafe-review-admission-v1:') == 1)
+              return decode(matches[0])
+
+
+          def subject(pr, repository, repository_id):
+              require(type(pr['number']) is int and pr['number'] > 0 and pr['state'] == 'open' and pr['draft'] is False)
+              for side in ('head', 'base'):
+                  require(pr[side]['repo']['full_name'] == repository and pr[side]['repo']['id'] == repository_id and
+                          type(pr[side]['sha']) is str and SHA.fullmatch(pr[side]['sha']))
+              require(pr['head']['repo']['fork'] is False and pr['base']['ref'] == 'main' and pr['user']['type'] == 'User')
+              return dict(repository=repository, pr=pr['number'], head=pr['head']['sha'], base=pr['base']['sha'])
+
+
+          def snapshot(event, env, api, now):
+              repository = env['GITHUB_REPOSITORY']
+              require(repository in REPOSITORIES and env['GITHUB_EVENT_NAME'] == 'pull_request' and env['GITHUB_RUN_ATTEMPT'] == '1')
+              require(re.fullmatch('[1-9][0-9]{0,19}', env['GITHUB_RUN_ID']) and SHA.fullmatch(env['GITHUB_SHA']))
+              require(env['GITHUB_ACTOR'] == env['GITHUB_TRIGGERING_ACTOR'] == event['sender']['login'] == COORDINATOR and
+                      event['sender']['type'] == 'User')
+              native_repository = event['repository']
+              require(native_repository['full_name'] == repository and type(native_repository['id']) is int and native_repository['id'] > 0)
+              expected = subject(event['pull_request'], repository, native_repository['id'])
+              require(env['GITHUB_REF'] == 'refs/pull/' + str(expected['pr']) + '/merge')
+              prefix = '/repos/' + repository
+              repo = api.request(prefix)
+              require(repo['id'] == native_repository['id'] and repo['full_name'] == repository and repo['private'] is False and repo['default_branch'] == 'main')
+              run = api.request(prefix + '/actions/runs/' + env['GITHUB_RUN_ID'] + '/attempts/1')
+              require(str(run['id']) == env['GITHUB_RUN_ID'] and run['run_attempt'] == 1 and run['event'] == 'pull_request' and
+                      run['repository']['id'] == repo['id'] and run['head_repository']['id'] == repo['id'] and
+                      run['head_sha'] == expected['head'] and run['status'] == 'in_progress' and run['conclusion'] is None and
+                      run['actor']['login'] == run['triggering_actor']['login'] == COORDINATOR)
+              permission = api.request(prefix + '/collaborators/' + COORDINATOR + '/permission')
+              require(permission['permission'] == 'admin' and permission['user']['login'] == COORDINATOR)
+              branch = api.request(prefix + '/branches/main')
+              require(branch['protected'] is True and branch['commit']['sha'] == expected['base'])
+              path = prefix + '/pulls/' + str(expected['pr'])
+              current = api.request(path)
+              require(subject(current, repository, repo['id']) == expected and current['mergeable'] is True and
+                      current['merge_commit_sha'] == env['GITHUB_SHA'] and not current['requested_reviewers'] and not current['requested_teams'])
+              integration = api.request(prefix + '/git/commits/' + env['GITHUB_SHA'])
+              require(integration['sha'] == env['GITHUB_SHA'] and SHA.fullmatch(integration['tree']['sha']) and
+                      [p['sha'] for p in integration['parents']] == [expected['base'], expected['head']])
+              ref = api.request(prefix + '/git/ref/pull/' + str(expected['pr']) + '/merge')
+              require(ref['object']['type'] == 'commit' and ref['object']['sha'] == env['GITHUB_SHA'])
+              action = event['action']
+              if action == 'auto_merge_enabled':
+                  native = current['auto_merge']
+                  prior = event['pull_request']['auto_merge']
+                  require(type(native) is dict and type(prior) is dict and native['enabled_by']['login'] == COORDINATOR and
+                          prior['enabled_by']['login'] == COORDINATOR and native['merge_method'] == prior['merge_method'] and
+                          native['merge_method'] in ('merge', 'squash', 'rebase'))
+                  # REST/event auto_merge has no timestamp. Use the native GraphQL
+                  # request identity and bind its enabledAt to this original run.
+                  request = api.auto_merge(repository, expected['pr'])
+                  require(type(request) is dict and request['enabledBy'] == dict(login=COORDINATOR, __typename='User') and
+                          request['mergeMethod'] == native['merge_method'].upper())
+                  require(0 <= (stamp(run['created_at']) - stamp(request['enabledAt'])).total_seconds() <= 600)
+              else:
+                  require(repository == 'EffortlessMetrics/unsafe-review-swarm' and action == 'edited')
+                  request = record(current['body'])
+                  require(current['body'] == event['pull_request']['body'])
+                  previous = event['changes']['body']['from']
+                  require(type(previous) is str and ('<!-- unsafe-review-admission-v1:' not in previous or
+                          record(previous)['request_id'] != request['request_id']))
+                  require(set(request) == set(expected) | {'integration', 'tree', 'coordinator', 'request_id', 'review_id', 'issued_at'})
+                  require(all(request[k] == v for k, v in expected.items()) and request['integration'] == env['GITHUB_SHA'] and
+                          request['tree'] == integration['tree']['sha'] and request['coordinator'] == COORDINATOR and
+                          re.fullmatch('[0-9a-f]{32}', request['request_id']) and type(request['review_id']) is int and request['review_id'] > 0)
+                  require(0 <= (stamp(event['pull_request']['updated_at']) - stamp(request['issued_at'])).total_seconds() <= 60 and
+                          0 <= (now - stamp(request['issued_at'])).total_seconds() <= 600)
+              reviews = api.reviews(path)
+              if action == 'edited':
+                  require(any(row.get('id') == request['review_id'] and row.get('commit_id') == expected['head'] and
+                              row.get('state') in ('APPROVED', 'COMMENTED') and row.get('user', {}).get('login') == COORDINATOR and
+                              stamp(row['submitted_at']) <= stamp(request['issued_at']) for row in reviews))
+              threads = api.threads(repository, expected['pr'])
+              return dict(subject=expected, integration=env['GITHUB_SHA'], tree=integration['tree']['sha'], request=request,
+                          reviews=reviews, threads=threads, actor=COORDINATOR, run=env['GITHUB_RUN_ID'], attempt='1')
+
+
+          def execute(argv, cwd, env, limit=1024**2):
+              # Bound child wall time and captured output; never print raw API/owner text.
+              with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+                  process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=out, stderr=err, start_new_session=True)
+                  deadline = time.monotonic() + 90
+                  try:
+                      while process.poll() is None:
+                          require(time.monotonic() < deadline and os.fstat(out.fileno()).st_size <= limit and
+                                  os.fstat(err.fileno()).st_size <= 65536)
+                          time.sleep(0.05)
+                      require(process.returncode == 0 and os.fstat(out.fileno()).st_size <= limit and os.fstat(err.fileno()).st_size <= 65536)
+                      out.seek(0)
+                      return out.read(limit + 1)
+                  finally:
+                      if process.poll() is None:
+                          os.killpg(process.pid, signal.SIGKILL)
+                          process.wait()
+
+
+          def owner_results(semantic, convergence, expected):
+              require(semantic.get('schema_version') == 'semantic_review_currentness.v1' and semantic.get('classification') == 'REVIEW_CURRENT' and
+                      semantic.get('acquisition_mode') == 'gh_live' and semantic.get('repo') == expected['repository'] and
+                      semantic.get('pr') == expected['pr'] and semantic.get('current_head') == expected['head'])
+              require(convergence.get('schema_version') == 'convergence_core.v1' and
+                      convergence.get('wrapper_schema_version') == 'pr_review_convergence.v2' and
+                      convergence.get('pr') == expected['pr'] and convergence.get('headRefOid') == expected['head'] and
+                      convergence.get('converged') is True and convergence.get('native_review_facts_converged') is True)
+
+
+          def owners(expected, env, directory, run=execute):
+              # No candidate checkout or global/user Git configuration reaches these tools.
+              home = directory / 'home'; home.mkdir(mode=0o700)
+              objects = pathlib.Path(env['GITHUB_WORKSPACE']) / '.git/objects'
+              require(objects.is_absolute() and '\n' not in str(objects) and '\r' not in str(objects) and '..' not in objects.parts and
+                      stat.S_ISDIR(objects.lstat().st_mode) and not objects.is_symlink())
+              child = dict(PATH='/usr/local/bin:/usr/bin:/bin', HOME=str(home), XDG_CONFIG_HOME=str(home),
+                           TMPDIR=str(directory), LANG='C.UTF-8', PYTHONIOENCODING='utf-8',
+                           GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null', GIT_TERMINAL_PROMPT='0',
+                           GIT_NO_REPLACE_OBJECTS='1', GH_TOKEN=env['EM_CI_ADMISSION_TOKEN'], GH_HOST='github.com', GH_PROMPT_DISABLED='1')
+              # A missing immutable-image tool is an admission refusal, never typed fallback.
+              require(all(shutil.which(tool, path=child['PATH']) for tool in ('git', 'gh', 'jq', 'bash', 'python3')))
+              root = directory / 'source'; root.mkdir(mode=0o700)
+              run(['git', 'init', '--quiet', str(root)], directory, child)
+              (root / '.git/objects/info/alternates').write_text(str(objects.resolve()) + '\n')
+              run(['git', 'config', 'core.hooksPath', '/dev/null'], root, child)
+              run(['git', 'config', 'core.attributesFile', '/dev/null'], root, child)
+              run(['git', 'remote', 'add', 'origin', 'https://github.com/' + expected['repository'] + '.git'], root, child)
+              trusted = directory / 'owners'; trusted.mkdir(mode=0o700)
+              for path in OWNERS:
+                  row = run(['git', 'ls-tree', expected['base'], '--', path], root, child, 4096).decode().strip()
+                  match = re.fullmatch(r'(100644|100755) blob ([0-9a-f]{40})\t' + re.escape(path), row)
+                  require(match)
+                  raw = run(['git', 'cat-file', 'blob', match[2]], root, child, 512 * 1024)
+                  require(hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest() == match[2])
+                  (trusted / pathlib.Path(path).name).write_bytes(raw)
+              semantic = decode(run(['python3', '-I', str(trusted / pathlib.Path(OWNERS[0]).name), str(expected['pr']), expected['repository'],
+                                     '--root', str(root), '--expected-head', expected['head']], root, child))
+              raw = run(['bash', str(trusted / pathlib.Path(OWNERS[1]).name), str(expected['pr']), expected['repository']], root, child).decode()
+              convergence = decode(raw[raw.index('{'):])
+              owner_results(semantic, convergence, expected)
+
+
+          def admit(event, env, api, now, invoke=owners):
+              before = snapshot(event, env, api, now)
+              temporary = pathlib.Path(env['RUNNER_TEMP'])
+              require(temporary.is_absolute() and '\n' not in str(temporary) and '..' not in temporary.parts)
+              with tempfile.TemporaryDirectory(prefix='em-ci-native-admission-', dir=temporary) as path:
+                  invoke(before['subject'], env, pathlib.Path(path))
+              # Repeat authenticated native authority after the owning checks, immediately
+              # before emitting proof-entry eligibility. These reads are not an atomic lock.
+              after = snapshot(event, env, api, dt.datetime.now(dt.timezone.utc))
+              require(before == after)
+              return dict(schema='em-ci-native-proof-admission.v1', repository=env['GITHUB_REPOSITORY'],
+                          run_id=env['GITHUB_RUN_ID'], run_attempt=env['GITHUB_RUN_ATTEMPT'], sha=env['GITHUB_SHA'],
+                          head=before['subject']['head'], base=before['subject']['base'], tree=before['tree'])
+
+
+          if __name__ == '__main__':
+              try:
+                  event_path = pathlib.Path(os.environ['GITHUB_EVENT_PATH'])
+                  require(event_path.stat().st_size <= 1024**2)
+                  event = decode(event_path.read_bytes())
+                  receipt = admit(event, os.environ, API(os.environ['EM_CI_ADMISSION_TOKEN']), dt.datetime.now(dt.timezone.utc))
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                      output.write('admitted=true\n')
+                  print(json.dumps(receipt, sort_keys=True))
+              except Exception:
+                  print('::error::native proof admission refused or unavailable')
+                  raise SystemExit(1)
+          PYTHON
       - name: Run repository proof
         id: proof
-        if: steps.toolchain.outcome == 'success' && steps.prepare.outcome == 'success' && steps.toolchain.outputs.infrastructure_failure == '' && steps.prepare.outputs.infrastructure_failure == '' && (!inputs.upload_artifacts || steps.artifact_prepare.outcome == 'success')
+        if: (inputs.proof_admission == '' || (steps.admission.outcome == 'success' && steps.admission.outputs.admitted == 'true')) && steps.toolchain.outcome == 'success' && steps.prepare.outcome == 'success' && steps.toolchain.outputs.infrastructure_failure == '' && steps.prepare.outputs.infrastructure_failure == '' && (!inputs.upload_artifacts || inputs.artifact_lane != 'ripr' || steps.artifact_prepare.outcome == 'success')
         shell: bash
         env:
           EM_CI_PROOF_SCRIPT: ${{ inputs.script }}
@@ -438,7 +739,7 @@ jobs:
 
       - name: Validate bounded canonical RIPR package
         id: artifact_package
-        if: always() && !cancelled() && inputs.upload_artifacts && steps.artifact_prepare.outcome == 'success'
+        if: always() && !cancelled() && inputs.upload_artifacts && inputs.artifact_lane == 'ripr' && steps.artifact_prepare.outcome == 'success'
         shell: bash
         env:
           PROOF_ENTERED_AT: ${{ steps.proof.outputs.proof_entered_at }}
@@ -447,7 +748,7 @@ jobs:
           ARTIFACT_NAME: ${{ steps.artifact_prepare.outputs.name }}
         run: |
           set -euo pipefail
-          python3 - <<'PYTHON'
+          python3 -I - <<'PYTHON'
           import datetime, json, os, pathlib, stat
 
           MAX_FILES = 512
@@ -522,7 +823,7 @@ jobs:
           PYTHON
       - name: Upload bounded canonical RIPR receipts
         id: upload_artifacts
-        if: always() && !cancelled() && inputs.upload_artifacts && steps.artifact_package.outputs.upload == 'true'
+        if: always() && !cancelled() && inputs.upload_artifacts && inputs.artifact_lane == 'ripr' && steps.artifact_package.outputs.upload == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ${{ steps.artifact_prepare.outputs.name }}
@@ -531,7 +832,190 @@ jobs:
           compression-level: 0
           retention-days: 14
 
+      - name: Stage bounded failure diagnostics
+        id: failure_diagnostics
+        if: always() && !cancelled() && inputs.upload_artifacts && inputs.artifact_lane == 'failure-diagnostics' && steps.proof.outcome == 'failure' && steps.proof.outputs.proof_entered_at != ''
+        continue-on-error: true
+        timeout-minutes: 1
+        shell: bash
+        env:
+          PROOF_OUTCOME: ${{ steps.proof.outcome }}
+          PROOF_ENTERED_AT: ${{ steps.proof.outputs.proof_entered_at }}
+          NATIVE_JOB: ${{ toJSON(job) }}
+          SELECTED_PROFILE: ${{ needs.classify.outputs.profile }}
+          SUMMARY_PATH: ${{ steps.proof.outputs.summary_path }}
+          METADATA_PATH: ${{ steps.proof.outputs.metadata_path }}
+          DIAGNOSTICS_PATH: ${{ steps.proof.outputs.diagnostics_path }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PYTHON'
+          import datetime, json, os, pathlib, re, stat, tempfile
+
+          COMMAND = 'cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && '
+          TAIL = 'RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked && cargo run --locked -p xtask -- check-pr'
+          COMMANDS = (COMMAND + TAIL, COMMAND + 'cargo run --locked -p xtask -- ci-test && ' + TAIL,
+                      'deterministic core suite (launch mode unavailable)')
+          STEPS = ('fmt', 'clippy', 'test', 'doc', 'check-pr')
+
+
+          def require(ok):
+              if not ok:
+                  raise ValueError('failure diagnostics rejected')
+
+
+          def object_pairs(pairs):
+              result = {}
+              for key, value in pairs:
+                  require(key not in result)
+                  result[key] = value
+              return result
+
+
+          def parse(raw):
+              return json.loads(raw.decode('utf-8'), object_pairs_hook=object_pairs,
+                                parse_constant=lambda value: require(False))
+
+
+          def read_at(directory, name, limit, start):
+              # Anchor every read to the opened staging directory. Never follow links or
+              # read a FIFO/device, including when a file is replaced during publication.
+              fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+              try:
+                  before = os.fstat(fd)
+                  require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and
+                          0 < before.st_size <= limit and before.st_mtime >= start)
+                  raw = os.read(fd, limit + 1)
+                  after = os.fstat(fd)
+                  # Reading may advance atime (not a content mutation) on Linux.
+                  fields = ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
+                  require(len(raw) == before.st_size and all(getattr(before, key) == getattr(after, key) for key in fields) and after.st_nlink == 1)
+                  return raw
+              finally:
+                  os.close(fd)
+
+
+          def diagnostics(raw):
+              value = parse(raw)
+              require(type(value) is dict and set(value) == {
+                  'schema_version', 'runner', 'runner_version', 'nextest_exit', 'doctest_exit',
+                  'core_exit', 'stream_status', 'parse_reason', 'records'})
+              require(value['schema_version'] == '1.0' and value['runner'] == 'cargo-nextest' and value['runner_version'] == '0.9.143')
+              for key in ('nextest_exit', 'doctest_exit', 'core_exit'):
+                  require(type(value[key]) is int and -(2**31) <= value[key] < 2**31)
+              require(value['core_exit'] == (value['nextest_exit'] or value['doctest_exit']))
+              status = value['stream_status']
+              require(status in ('ok', 'missing_report', 'unavailable_report', 'malformed_report', 'malformed_record',
+                                 'unexpected_field', 'hostile_record', 'truncated_input', 'record_limit', 'overlong_record'))
+              reason = value['parse_reason']
+              require(reason is None or reason in ('unexpected_root', 'unknown_attribute', 'malformed_tag', 'unsupported_structure',
+                      'unknown_element', 'malformed_nesting', 'unsupported_identity', 'report_io', 'input_limit'))
+              require((reason is not None) == (status not in ('ok', 'missing_report')))
+              require(type(value['records']) is list and len(value['records']) <= 128)
+              previous = None
+              for record in value['records']:
+                  require(type(record) is dict and set(record) == {'package', 'test', 'status'} and record['status'] == 'failed')
+                  for key in ('package', 'test'):
+                      field = record[key]
+                      require(type(field) is str and 0 < len(field.encode('utf-8')) <= 256 and
+                              not any(marker in field for marker in ('-----BEGIN', 'ghp_', 'github_pat_', 'AKIA', 'eyJhbGci')))
+                  require(re.fullmatch(r'[A-Za-z0-9_-]+(?:::(?:(?:bin|bench|example)/)?[A-Za-z0-9_-]+)?', record['package']))
+                  require(all(re.fullmatch(r'(?:r#)?[A-Za-z_][A-Za-z0-9_]*', part) and part not in ('_', 'r#_')
+                              for part in record['test'].split('::')))
+                  current = (record['package'], record['test'])
+                  require(previous is None or previous < current)
+                  previous = current
+
+
+          def package():
+              # Success, cancellation and pre-proof withdrawal never publish this lane.
+              if os.environ['PROOF_OUTCOME'] != 'failure' or not os.environ['PROOF_ENTERED_AT']:
+                  return
+              summary = os.environ.get('SUMMARY_PATH', '')
+              metadata = os.environ.get('METADATA_PATH', '')
+              optional = os.environ.get('DIAGNOSTICS_PATH', '')
+              if not summary and not metadata and not optional:
+                  return
+              run = os.environ['GITHUB_RUN_ID']
+              attempt = os.environ['GITHUB_RUN_ATTEMPT']
+              sha = os.environ['GITHUB_SHA']
+              require(re.fullmatch('[1-9][0-9]{0,19}', run) and re.fullmatch('[1-9][0-9]{0,9}', attempt) and re.fullmatch('[0-9a-f]{40}', sha))
+              job = parse(os.environ['NATIVE_JOB'].encode('utf-8'))
+              profile = os.environ['SELECTED_PROFILE']
+              require(type(job) is dict and type(job.get('check_run_id')) is int and 0 < job['check_run_id'] < 2**63 and
+                      profile in ('light', 'standard', 'heavy', 'large'))
+              producer = profile + '-' + str(job['check_run_id'])
+              key = run + '-' + attempt
+              temporary = pathlib.Path(os.environ['RUNNER_TEMP'])
+              require(temporary.is_absolute() and '..' not in temporary.parts)
+              root = temporary / ('unsafe-review-core-evidence-' + key)
+              parent = pathlib.Path(summary).parent
+              require(parent.parent == root and re.fullmatch('staging-[A-Za-z0-9]+', parent.name))
+              require(summary == str(parent / 'summary.md') and metadata == str(parent / 'metadata.json') and
+                      optional in ('', str(parent / 'test-diagnostics.json')))
+              start = datetime.datetime.strptime(os.environ['PROOF_ENTERED_AT'], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc).timestamp()
+              # Open the absolute chain without symlinks or lexical escapes. The final
+              # source directory is private, as is the independent publication staging.
+              fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+              try:
+                  for part in parent.parts[1:]:
+                      next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                      os.close(fd)
+                      fd = next_fd
+                  require(stat.S_IMODE(os.fstat(fd).st_mode) == 0o700 and os.fstat(fd).st_uid == os.geteuid())
+                  files = {'summary.md': read_at(fd, 'summary.md', 16384, start),
+                           'metadata.json': read_at(fd, 'metadata.json', 4096, start)}
+                  if optional:
+                      files['test-diagnostics.json'] = read_at(fd, 'test-diagnostics.json', 16385, start)
+                      diagnostics(files['test-diagnostics.json'])
+              finally:
+                  os.close(fd)
+              value = parse(files['metadata.json'])
+              require(type(value) is dict and set(value) == {'schema_version', 'commit', 'command', 'exit_code', 'failed_step', 'result_path', 'summary_path'})
+              require(value['schema_version'] == '1.0' and value['commit'] == sha and value['command'] in COMMANDS and
+                      type(value['exit_code']) is int and 1 <= value['exit_code'] <= 255 and value['failed_step'] in (*STEPS, 'unknown') and
+                      value['result_path'] == 'target/ci-core/core_exit-' + key and value['summary_path'] == summary)
+              text = files['summary.md'].decode('utf-8')
+              prefix = ('# Deterministic core-gate failure evidence\n\n- commit: `' + sha + '`\n- command: `' + value['command'] +
+                        '`\n- exit code: `' + str(value['exit_code']) + '`\n- failed step: `' + value['failed_step'] +
+                        '`\n- result path: `' + value['result_path'] + '`\n\n## Bounded allowlisted step status\n\n' +
+                        '    step_id\telapsed_seconds\texit_status\n')
+              suffix = '\n> Closed-vocabulary diagnostic only. The raw core log is not retained.\n'
+              require(text.startswith(prefix) and text.endswith(suffix))
+              rows = text[len(prefix):-len(suffix)].splitlines()
+              require(len(rows) <= 79)
+              for row in rows:
+                  require(re.fullmatch(r'    (fmt|clippy|test|doc|check-pr)\t[0-9]{1,10}\t([0-9]{1,3}|skipped)', row))
+              # Only fixed names from validated in-memory bytes can reach the uploader.
+              destination = pathlib.Path(tempfile.mkdtemp(prefix='em-ci-failure-diagnostics-', dir=temporary))
+              for name, raw in files.items():
+                  descriptor = os.open(destination / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                  with os.fdopen(descriptor, 'wb') as output:
+                      output.write(raw)
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  output.write('path=' + str(destination) + '\nname=em-ci-rust-failure-diagnostics-' + producer + '-' + key + '\nupload=true\n')
+
+
+          if __name__ == '__main__':
+              try:
+                  package()
+              except (OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+                  # Do not echo untrusted paths, JSON, raw logs or exception text.
+                  print('::warning::bounded failure diagnostics unavailable')
+                  raise SystemExit(1)
+          PYTHON
+      - name: Upload bounded failure diagnostics
+        if: always() && !cancelled() && inputs.upload_artifacts && inputs.artifact_lane == 'failure-diagnostics' && steps.proof.outcome == 'failure' && steps.failure_diagnostics.outcome == 'success' && steps.failure_diagnostics.outputs.upload == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ${{ steps.failure_diagnostics.outputs.name }}
+          path: ${{ steps.failure_diagnostics.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7
+
   standard:
+    permissions: *proof_permissions
     name: Rust standard
     needs: classify
     if: needs.classify.outputs.self_hosted == 'true' && needs.classify.outputs.profile == 'standard'
@@ -545,6 +1029,7 @@ jobs:
     steps: *proof_steps
 
   heavy:
+    permissions: *proof_permissions
     name: Rust heavy
     needs: classify
     if: needs.classify.outputs.self_hosted == 'true' && needs.classify.outputs.profile == 'heavy'
@@ -558,6 +1043,7 @@ jobs:
     steps: *proof_steps
 
   large:
+    permissions: *proof_permissions
     name: Rust large
     needs: classify
     if: needs.classify.outputs.self_hosted == 'true' && needs.classify.outputs.profile == 'large'
@@ -571,6 +1057,7 @@ jobs:
     steps: *proof_steps
 
   hosted:
+    permissions: *proof_permissions
     name: Rust hosted external
     needs: classify
     if: needs.classify.outputs.self_hosted == 'false' && needs.classify.outputs.hosted_enabled == 'true'
@@ -604,6 +1091,7 @@ jobs:
           exit 75
 
   hosted-fallback:
+    permissions: *proof_permissions
     name: Rust hosted pre-proof recovery
     needs: [classify, light, standard, heavy, large]
     # Only a positively withdrawn admission is normalized; the proof remains skipped.
@@ -772,7 +1260,7 @@ jobs:
           }
       - name: Authenticate and import canonical RIPR receipts
         id: import_receipts
-        if: inputs.upload_artifacts && steps.evaluate.outcome == 'success'
+        if: inputs.upload_artifacts && inputs.artifact_lane == 'ripr' && steps.evaluate.outcome == 'success'
         shell: bash
         env:
           CANONICAL_RIPR_PATHS: '["target/ripr/pr/raw-check.json","target/ripr/pr/repo-exposure.json","target/ripr/review/comments.json","target/receipts/quality/ripr-plus.json","target/receipts/quality/quality-gate-ripr.json","target/receipts/quality/quality-gate-ripr.md","target/xtask/impacted-evidence/latest.json","target/xtask/impacted-evidence/latest.md","ripr-tool-identity.txt","ripr-cgroup-memory.txt"]'
@@ -794,7 +1282,7 @@ jobs:
           SUBJECT_PR_BASE: ${{ github.event.pull_request.base.sha || '' }}
         run: |
           set -euo pipefail
-          python3 - <<'PYTHON'
+          python3 -I - <<'PYTHON'
           import datetime, hashlib, json, os, pathlib, re, stat, struct, time
           import urllib.error, urllib.parse, urllib.request, zipfile
 
@@ -1165,7 +1653,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PYTHON'
+          python3 -I - <<'PYTHON'
           import json, os, pathlib
           evidence = json.loads(os.environ['EM_CI_EVIDENCE'])
           context = json.loads(os.environ['EM_CI_JOB_CONTEXT'])
