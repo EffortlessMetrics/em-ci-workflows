@@ -89,7 +89,8 @@ workflow compares `git rev-parse HEAD` with the classified SHA before any
 repository script executes. Job context retains the target SHA separately from
 the event SHA.
 
-Use `fetch_depth: 0` only when the proof script compares revisions. Consumer
+Use `fetch_depth: 0` when the proof script compares revisions or when selecting
+Rust native review admission below. Consumer
 workflows cannot provide `runs-on`, a container image, an arbitrary shell body,
 or an artifact path.
 
@@ -189,6 +190,54 @@ The immutable aggregate executes no caller code or archive import and withholds
 successful outputs until native policy success and its own small upload pass.
 Default callers are unchanged. Real native/domain/resource qualification and
 the exact workflow allowance precede migration or required-check cutover.
+
+## Optional failure diagnostics
+
+Rust callers may select `upload_artifacts: true` and
+`artifact_lane: failure-diagnostics`, with no `result_script`. The default is
+off. Only an entered failed proof can publish; this mode never turns failure
+into proof success and is separate from canonical RIPR custody.
+
+The proof exposes step outputs `summary_path`, `metadata_path` and optionally
+`diagnostics_path`. They must name exactly `summary.md`, `metadata.json` and
+`test-diagnostics.json` in a fresh private
+`RUNNER_TEMP/unsafe-review-core-evidence-RUN-ATTEMPT/staging-SUFFIX` directory.
+The publisher checks closed summary/metadata/nextest schemas, current source,
+run and attempt, freshness, size and regular single-link file custody. It rejects
+extra fields, path escapes, links, stale data and raw logs. Accepted bytes are
+copied into independent private staging; the two mandatory files are bounded
+at 16 KiB and 4 KiB and optional diagnostics at 16 KiB plus one trailing newline.
+Validation and upload are time-bounded and nonfatal, with seven-day retention;
+the original product outcome remains authoritative. Cancellation can produce
+no attachment. This mode does not provide full product artifact custody.
+
+## Optional native review admission
+
+`proof_admission: native-review-v1` is default-off and requires
+`fetch_depth: 0`. This closed mode accepts native `pull_request` events for the
+fixed supported Perl/Unsafe-review repositories, same-repository non-bot PRs,
+and the configured coordinator's current native authority. It supports native
+`auto_merge_enabled` requests, and Unsafe-review's explicitly changed fresh
+request-body form. Callers must subscribe to the relevant lifecycle event;
+a shallow checkout or an arbitrary dispatch/body assertion cannot substitute
+for the native request and current protected review owners.
+
+After allocation and immediately before proof, immutable code rechecks the
+current original/triggering actor, permission, request/reviews/threads,
+head/protected base, integration identity and original run/attempt. It executes
+only the fixed hash-checked review owners extracted from protected-base source,
+then repeats currentness reads. Refusal fails the call, including after a typed
+infrastructure withdrawal; it cannot become a hosted recovery success. Every
+eligible recovery proof must pass this same admission gate.
+
+The runtime must independently supply Python, Git, Bash, jq and gh in
+`/usr/local/bin:/usr/bin:/bin`. The current immutable image source does not
+declare gh, and Unsafe-review protected main lacks the required owners; these
+are blocking activation dependencies. Missing tools/owners fail closed; no
+runtime tool installer or new credential is supplied. Native positive/refusal/
+recovery/product/result/cleanup qualification and separately authorized workflow
+allowance/caller activation remain required. Publication alone enables neither
+mode and changes no active pin, required check, host or access setting.
 
 ## Security
 
