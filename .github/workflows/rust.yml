@@ -30,12 +30,12 @@ on:
         default: ''
         type: string
       artifact_lane:
-        description: Canonical RIPR attachment lane; must be ripr when upload_artifacts is enabled
+        description: "Closed artifact lane: ripr or failure-diagnostics; empty when disabled"
         required: false
         default: ''
         type: string
       upload_artifacts:
-        description: Return complete canonical RIPR receipts to the configured repository policy
+        description: Opt in to the selected bounded artifact lane
         required: false
         default: false
         type: boolean
@@ -104,10 +104,11 @@ jobs:
 
           case "$REQUESTED_UPLOAD_ARTIFACTS" in
             true)
-              [[ "$REQUESTED_ARTIFACT_LANE" == ripr && -n "$REQUESTED_RESULT_SCRIPT" ]] || {
-                echo '::error::RIPR transport requires artifact_lane=ripr and repository result policy'
-                exit 64
-              }
+              case "$REQUESTED_ARTIFACT_LANE" in
+                ripr) [[ -n "$REQUESTED_RESULT_SCRIPT" ]] || exit 64 ;;
+                failure-diagnostics) [[ -z "$REQUESTED_RESULT_SCRIPT" ]] || exit 64 ;;
+                *) exit 64 ;;
+              esac
               ;;
             false) [[ -z "$REQUESTED_ARTIFACT_LANE" ]] || exit 64 ;;
             *) exit 64 ;;
@@ -316,7 +317,7 @@ jobs:
           echo "TMPDIR=$RUNNER_TEMP/tmp" >> "$GITHUB_ENV"
       - name: Prepare canonical RIPR artifact root
         id: artifact_prepare
-        if: inputs.upload_artifacts && steps.toolchain.outcome == 'success' && steps.prepare.outcome == 'success' && steps.toolchain.outputs.infrastructure_failure == '' && steps.prepare.outputs.infrastructure_failure == ''
+        if: inputs.upload_artifacts && inputs.artifact_lane == 'ripr' && steps.toolchain.outcome == 'success' && steps.prepare.outcome == 'success' && steps.toolchain.outputs.infrastructure_failure == '' && steps.prepare.outputs.infrastructure_failure == ''
         shell: bash
         env:
           NATIVE_JOB: ${{ toJSON(job) }}
@@ -374,7 +375,7 @@ jobs:
           PYTHON
       - name: Run repository proof
         id: proof
-        if: steps.toolchain.outcome == 'success' && steps.prepare.outcome == 'success' && steps.toolchain.outputs.infrastructure_failure == '' && steps.prepare.outputs.infrastructure_failure == '' && (!inputs.upload_artifacts || steps.artifact_prepare.outcome == 'success')
+        if: steps.toolchain.outcome == 'success' && steps.prepare.outcome == 'success' && steps.toolchain.outputs.infrastructure_failure == '' && steps.prepare.outputs.infrastructure_failure == '' && (!inputs.upload_artifacts || inputs.artifact_lane != 'ripr' || steps.artifact_prepare.outcome == 'success')
         shell: bash
         env:
           EM_CI_PROOF_SCRIPT: ${{ inputs.script }}
@@ -438,7 +439,7 @@ jobs:
 
       - name: Validate bounded canonical RIPR package
         id: artifact_package
-        if: always() && !cancelled() && inputs.upload_artifacts && steps.artifact_prepare.outcome == 'success'
+        if: always() && !cancelled() && inputs.upload_artifacts && inputs.artifact_lane == 'ripr' && steps.artifact_prepare.outcome == 'success'
         shell: bash
         env:
           PROOF_ENTERED_AT: ${{ steps.proof.outputs.proof_entered_at }}
@@ -522,7 +523,7 @@ jobs:
           PYTHON
       - name: Upload bounded canonical RIPR receipts
         id: upload_artifacts
-        if: always() && !cancelled() && inputs.upload_artifacts && steps.artifact_package.outputs.upload == 'true'
+        if: always() && !cancelled() && inputs.upload_artifacts && inputs.artifact_lane == 'ripr' && steps.artifact_package.outputs.upload == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ${{ steps.artifact_prepare.outputs.name }}
@@ -530,6 +531,188 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+      - name: Stage bounded failure diagnostics
+        id: failure_diagnostics
+        if: always() && !cancelled() && inputs.upload_artifacts && inputs.artifact_lane == 'failure-diagnostics' && steps.proof.outcome == 'failure' && steps.proof.outputs.proof_entered_at != ''
+        continue-on-error: true
+        timeout-minutes: 1
+        shell: bash
+        env:
+          PROOF_OUTCOME: ${{ steps.proof.outcome }}
+          PROOF_ENTERED_AT: ${{ steps.proof.outputs.proof_entered_at }}
+          NATIVE_JOB: ${{ toJSON(job) }}
+          SELECTED_PROFILE: ${{ needs.classify.outputs.profile }}
+          SUMMARY_PATH: ${{ steps.proof.outputs.summary_path }}
+          METADATA_PATH: ${{ steps.proof.outputs.metadata_path }}
+          DIAGNOSTICS_PATH: ${{ steps.proof.outputs.diagnostics_path }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import datetime, json, os, pathlib, re, stat, tempfile
+
+          COMMAND = 'cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && '
+          TAIL = 'RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked && cargo run --locked -p xtask -- check-pr'
+          COMMANDS = (COMMAND + TAIL, COMMAND + 'cargo run --locked -p xtask -- ci-test && ' + TAIL,
+                      'deterministic core suite (launch mode unavailable)')
+          STEPS = ('fmt', 'clippy', 'test', 'doc', 'check-pr')
+
+
+          def require(ok):
+              if not ok:
+                  raise ValueError('failure diagnostics rejected')
+
+
+          def object_pairs(pairs):
+              result = {}
+              for key, value in pairs:
+                  require(key not in result)
+                  result[key] = value
+              return result
+
+
+          def parse(raw):
+              return json.loads(raw.decode('utf-8'), object_pairs_hook=object_pairs,
+                                parse_constant=lambda value: require(False))
+
+
+          def read_at(directory, name, limit, start):
+              # Anchor every read to the opened staging directory. Never follow links or
+              # read a FIFO/device, including when a file is replaced during publication.
+              fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+              try:
+                  before = os.fstat(fd)
+                  require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and
+                          0 < before.st_size <= limit and before.st_mtime >= start)
+                  raw = os.read(fd, limit + 1)
+                  after = os.fstat(fd)
+                  # Reading may advance atime (not a content mutation) on Linux.
+                  fields = ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
+                  require(len(raw) == before.st_size and all(getattr(before, key) == getattr(after, key) for key in fields) and after.st_nlink == 1)
+                  return raw
+              finally:
+                  os.close(fd)
+
+
+          def diagnostics(raw):
+              value = parse(raw)
+              require(type(value) is dict and set(value) == {
+                  'schema_version', 'runner', 'runner_version', 'nextest_exit', 'doctest_exit',
+                  'core_exit', 'stream_status', 'parse_reason', 'records'})
+              require(value['schema_version'] == '1.0' and value['runner'] == 'cargo-nextest' and value['runner_version'] == '0.9.143')
+              for key in ('nextest_exit', 'doctest_exit', 'core_exit'):
+                  require(type(value[key]) is int and -(2**31) <= value[key] < 2**31)
+              require(value['core_exit'] == (value['nextest_exit'] or value['doctest_exit']))
+              status = value['stream_status']
+              require(status in ('ok', 'missing_report', 'unavailable_report', 'malformed_report', 'malformed_record',
+                                 'unexpected_field', 'hostile_record', 'truncated_input', 'record_limit', 'overlong_record'))
+              reason = value['parse_reason']
+              require(reason is None or reason in ('unexpected_root', 'unknown_attribute', 'malformed_tag', 'unsupported_structure',
+                      'unknown_element', 'malformed_nesting', 'unsupported_identity', 'report_io', 'input_limit'))
+              require((reason is not None) == (status not in ('ok', 'missing_report')))
+              require(type(value['records']) is list and len(value['records']) <= 128)
+              previous = None
+              for record in value['records']:
+                  require(type(record) is dict and set(record) == {'package', 'test', 'status'} and record['status'] == 'failed')
+                  for key in ('package', 'test'):
+                      field = record[key]
+                      require(type(field) is str and 0 < len(field.encode('utf-8')) <= 256 and
+                              not any(marker in field for marker in ('-----BEGIN', 'ghp_', 'github_pat_', 'AKIA', 'eyJhbGci')))
+                  require(re.fullmatch(r'[A-Za-z0-9_-]+(?:::(?:(?:bin|bench|example)/)?[A-Za-z0-9_-]+)?', record['package']))
+                  require(all(re.fullmatch(r'(?:r#)?[A-Za-z_][A-Za-z0-9_]*', part) and part not in ('_', 'r#_')
+                              for part in record['test'].split('::')))
+                  current = (record['package'], record['test'])
+                  require(previous is None or previous < current)
+                  previous = current
+
+
+          def package():
+              # Success, cancellation and pre-proof withdrawal never publish this lane.
+              if os.environ['PROOF_OUTCOME'] != 'failure' or not os.environ['PROOF_ENTERED_AT']:
+                  return
+              summary = os.environ.get('SUMMARY_PATH', '')
+              metadata = os.environ.get('METADATA_PATH', '')
+              optional = os.environ.get('DIAGNOSTICS_PATH', '')
+              if not summary and not metadata and not optional:
+                  return
+              run = os.environ['GITHUB_RUN_ID']
+              attempt = os.environ['GITHUB_RUN_ATTEMPT']
+              sha = os.environ['GITHUB_SHA']
+              require(re.fullmatch('[1-9][0-9]{0,19}', run) and re.fullmatch('[1-9][0-9]{0,9}', attempt) and re.fullmatch('[0-9a-f]{40}', sha))
+              job = parse(os.environ['NATIVE_JOB'].encode('utf-8'))
+              profile = os.environ['SELECTED_PROFILE']
+              require(type(job) is dict and type(job.get('check_run_id')) is int and 0 < job['check_run_id'] < 2**63 and
+                      profile in ('light', 'standard', 'heavy', 'large'))
+              producer = profile + '-' + str(job['check_run_id'])
+              key = run + '-' + attempt
+              temporary = pathlib.Path(os.environ['RUNNER_TEMP'])
+              require(temporary.is_absolute() and '..' not in temporary.parts)
+              root = temporary / ('unsafe-review-core-evidence-' + key)
+              parent = pathlib.Path(summary).parent
+              require(parent.parent == root and re.fullmatch('staging-[A-Za-z0-9]+', parent.name))
+              require(summary == str(parent / 'summary.md') and metadata == str(parent / 'metadata.json') and
+                      optional in ('', str(parent / 'test-diagnostics.json')))
+              start = datetime.datetime.strptime(os.environ['PROOF_ENTERED_AT'], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc).timestamp()
+              # Open the absolute chain without symlinks or lexical escapes. The final
+              # source directory is private, as is the independent publication staging.
+              fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+              try:
+                  for part in parent.parts[1:]:
+                      next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                      os.close(fd)
+                      fd = next_fd
+                  require(stat.S_IMODE(os.fstat(fd).st_mode) == 0o700 and os.fstat(fd).st_uid == os.geteuid())
+                  files = {'summary.md': read_at(fd, 'summary.md', 16384, start),
+                           'metadata.json': read_at(fd, 'metadata.json', 4096, start)}
+                  if optional:
+                      files['test-diagnostics.json'] = read_at(fd, 'test-diagnostics.json', 16385, start)
+                      diagnostics(files['test-diagnostics.json'])
+              finally:
+                  os.close(fd)
+              value = parse(files['metadata.json'])
+              require(type(value) is dict and set(value) == {'schema_version', 'commit', 'command', 'exit_code', 'failed_step', 'result_path', 'summary_path'})
+              require(value['schema_version'] == '1.0' and value['commit'] == sha and value['command'] in COMMANDS and
+                      type(value['exit_code']) is int and 1 <= value['exit_code'] <= 255 and value['failed_step'] in (*STEPS, 'unknown') and
+                      value['result_path'] == 'target/ci-core/core_exit-' + key and value['summary_path'] == summary)
+              text = files['summary.md'].decode('utf-8')
+              prefix = ('# Deterministic core-gate failure evidence\n\n- commit: `' + sha + '`\n- command: `' + value['command'] +
+                        '`\n- exit code: `' + str(value['exit_code']) + '`\n- failed step: `' + value['failed_step'] +
+                        '`\n- result path: `' + value['result_path'] + '`\n\n## Bounded allowlisted step status\n\n' +
+                        '    step_id\telapsed_seconds\texit_status\n')
+              suffix = '\n> Closed-vocabulary diagnostic only. The raw core log is not retained.\n'
+              require(text.startswith(prefix) and text.endswith(suffix))
+              rows = text[len(prefix):-len(suffix)].splitlines()
+              require(len(rows) <= 79)
+              for row in rows:
+                  require(re.fullmatch(r'    (fmt|clippy|test|doc|check-pr)\t[0-9]{1,10}\t([0-9]{1,3}|skipped)', row))
+              # Only fixed names from validated in-memory bytes can reach the uploader.
+              destination = pathlib.Path(tempfile.mkdtemp(prefix='em-ci-failure-diagnostics-', dir=temporary))
+              for name, raw in files.items():
+                  descriptor = os.open(destination / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                  with os.fdopen(descriptor, 'wb') as output:
+                      output.write(raw)
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  output.write('path=' + str(destination) + '\nname=em-ci-rust-failure-diagnostics-' + producer + '-' + key + '\nupload=true\n')
+
+
+          if __name__ == '__main__':
+              try:
+                  package()
+              except (OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+                  # Do not echo untrusted paths, JSON, raw logs or exception text.
+                  print('::warning::bounded failure diagnostics unavailable')
+                  raise SystemExit(1)
+          PYTHON
+      - name: Upload bounded failure diagnostics
+        if: always() && !cancelled() && inputs.upload_artifacts && inputs.artifact_lane == 'failure-diagnostics' && steps.proof.outcome == 'failure' && steps.failure_diagnostics.outcome == 'success' && steps.failure_diagnostics.outputs.upload == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ${{ steps.failure_diagnostics.outputs.name }}
+          path: ${{ steps.failure_diagnostics.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7
 
   standard:
     name: Rust standard
@@ -772,7 +955,7 @@ jobs:
           }
       - name: Authenticate and import canonical RIPR receipts
         id: import_receipts
-        if: inputs.upload_artifacts && steps.evaluate.outcome == 'success'
+        if: inputs.upload_artifacts && inputs.artifact_lane == 'ripr' && steps.evaluate.outcome == 'success'
         shell: bash
         env:
           CANONICAL_RIPR_PATHS: '["target/ripr/pr/raw-check.json","target/ripr/pr/repo-exposure.json","target/ripr/review/comments.json","target/receipts/quality/ripr-plus.json","target/receipts/quality/quality-gate-ripr.json","target/receipts/quality/quality-gate-ripr.md","target/xtask/impacted-evidence/latest.json","target/xtask/impacted-evidence/latest.md","ripr-tool-identity.txt","ripr-cgroup-memory.txt"]'
