@@ -253,3 +253,36 @@ The public workflow distribution is available under either of:
 - MIT License (`LICENSE-MIT`)
 
 at your option.
+
+## Optional canonical Perl Rust Small receipt
+
+For `EffortlessMetrics/perl-lsp-swarm` only, Rust callers may select
+`artifact_lane: perl-rust-small`, `upload_artifacts: true`, `profile: standard`,
+`fetch_depth: 0` and `result_script: .ci/rust-standard-result.sh`. The default is
+off. Keep the existing proof script and canonical consumer exporter. This mode
+requires a published immutable workflow containing the selector and matching
+runner-group authorization; it does not activate a caller automatically.
+
+`EM_CI_ARTIFACT_DIR` points to a fresh private directory under `RUNNER_TEMP`.
+The packet contains exactly `rust-small-proof.json` (1 MiB),
+`perl-rust-small-export.json` (16 KiB) and central-owned
+`em-ci-job-context.json` (16 KiB), within a 2 MiB archive. The canonical receipt
+contains ten step records; it is distinct from RIPR's ten-file analysis packet.
+
+The closed export manifest binds exact receipt bytes/digest to source, run,
+attempt, profile, proof entry and outcome. Central publication/import rejects
+missing, extra, linked, stale, malformed or mismatched data. Native producer,
+workflow, artifact and run/attempt authentication remains mandatory. Retention
+is fourteen days; publication/import/verification failure blocks success.
+
+The actual repository-owned Rust receipt verifier runs on entered success/failure
+receipts after proof and on the
+imported receipt before result policy success, with immutable source-byte checks independent of Git index flags/replacement
+references, and metadata credentials removed from Cargo. Imported verification uses the existing
+35-minute policy envelope, the workflow compatibility toolchain (currently1.95.0),
+Cargo auto-install disabled, two build jobs and a temporary target; its cold build is additional cost, not product proof.
+Hosted policy jobs explicitly provision a missing approved toolchain with minimal
+Rustup; owned image jobs fail closed without installing tools. That provisioning
+and the cold validator build must fit the same envelope and remain runtime
+qualification obligations. A diagnostic failure receipt cannot satisfy success. Source fixture tests do not
+replace real consumer, attachment, resource or cleanup qualification.
