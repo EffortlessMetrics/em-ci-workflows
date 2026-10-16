@@ -39,6 +39,11 @@ on:
         required: false
         default: false
         type: boolean
+      perl_receipt_verifier:
+        description: "Perl canonical verifier entrypoint: xtask (default) or lightweight-v1 (explicit opt-in)"
+        required: false
+        default: xtask
+        type: string
       proof_admission:
         description: Optional closed native-review-v1 recheck after allocation and before proof
         required: false
@@ -124,6 +129,7 @@ jobs:
           REQUESTED_PROOF_SCRIPT: ${{ inputs.script }}
           REQUESTED_UPLOAD_ARTIFACTS: ${{ inputs.upload_artifacts }}
           REQUESTED_ARTIFACT_LANE: ${{ inputs.artifact_lane }}
+          REQUESTED_PERL_RECEIPT_VERIFIER: ${{ inputs.perl_receipt_verifier }}
           HOSTED_ENABLED: ${{ vars.EM_CI_GITHUB_HOSTED_ENABLED }}
           RUNNER_IMAGE: ${{ vars.EM_CI_RUNNER_IMAGE }}
         run: |
@@ -203,6 +209,14 @@ jobs:
               esac
               ;;
             false) [[ -z "$REQUESTED_ARTIFACT_LANE" ]] || exit 64 ;;
+            *) exit 64 ;;
+          esac
+
+          case "${REQUESTED_PERL_RECEIPT_VERIFIER:-xtask}" in
+            xtask) ;;
+            lightweight-v1)
+              [[ "$REQUESTED_UPLOAD_ARTIFACTS" == true && "$REQUESTED_ARTIFACT_LANE" == perl-rust-small ]] || exit 64
+              ;;
             *) exit 64 ;;
           esac
 
@@ -1001,6 +1015,7 @@ jobs:
         id: perl_semantics
         env:
           PERL_PACKET_DIR: ${{ steps.artifact_prepare.outputs.path }}
+          PERL_RECEIPT_VERIFIER: ${{ inputs.perl_receipt_verifier }}
         if: always() && !cancelled() && inputs.upload_artifacts && inputs.artifact_lane == 'perl-rust-small' && steps.proof.outputs.proof_entered_at != '' && (steps.proof.outcome == 'success' || steps.proof.outcome == 'failure')
         shell: bash
         run: |
@@ -1069,7 +1084,13 @@ jobs:
           # Execute the owning validator with the proof's existing target/toolchain.
           # No duplicated Python implementation may certify product semantics.
           unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN EM_CI_ADMISSION_TOKEN
-          cargo run -p xtask --locked -- rust-small-proof --verify-receipt "$PERL_PACKET_DIR/rust-small-proof.json"
+          # Closed selection; unsupported/missing packages fail without fallback.
+          case "${PERL_RECEIPT_VERIFIER:-xtask}" in
+            xtask) verifier=(-p xtask --locked -- rust-small-proof) ;;
+            lightweight-v1) verifier=(--locked -p perl-rust-small-verifier --) ;;
+            *) exit 64 ;;
+          esac
+          cargo run "${verifier[@]}" --verify-receipt "$PERL_PACKET_DIR/rust-small-proof.json"
       - name: Record compiler cache statistics
         if: always()
         env:
@@ -3478,6 +3499,8 @@ jobs:
           persist-credentials: false
       - name: Verify imported canonical Perl receipt
         id: perl_import_semantics
+        env:
+          PERL_RECEIPT_VERIFIER: ${{ inputs.perl_receipt_verifier }}
         if: inputs.upload_artifacts && inputs.artifact_lane == 'perl-rust-small' && steps.perl_import_custody.outcome == 'success' && steps.perl_policy_toolchain.outputs.prepared == 'true'
         shell: bash
         run: |
@@ -3544,11 +3567,17 @@ jobs:
           PYTHON
           git diff --quiet HEAD --
           [[ -z "$(git ls-files --others --exclude-standard)" ]]
-          # Receipt verification only. No product suite is rerun. A cold xtask
-          # build must fit the existing policy envelope; refusal remains blocking.
+          # Receipt verification only. Either entrypoint must fit the unchanged
+          # policy envelope; valid diagnostic receipts never certify product success.
+          # Closed selection; unsupported/missing packages fail without fallback.
+          case "${PERL_RECEIPT_VERIFIER:-xtask}" in
+            xtask) verifier=(-p xtask --locked -- rust-small-proof) ;;
+            lightweight-v1) verifier=(--locked -p perl-rust-small-verifier --) ;;
+            *) exit 64 ;;
+          esac
           RUSTUP_TOOLCHAIN="$EM_CI_RUST_COMPATIBILITY_VERSION" RUSTUP_AUTO_INSTALL=0 CARGO_BUILD_JOBS=2 \
             CARGO_TARGET_DIR="$RUNNER_TEMP/perl-receipt-validator-target" \
-            cargo run -p xtask --locked -- rust-small-proof --verify-receipt "$EM_CI_ARTIFACT_DIR/rust-small-proof.json"
+            cargo run "${verifier[@]}" --verify-receipt "$EM_CI_ARTIFACT_DIR/rust-small-proof.json"
       - name: Run repository result policy
         if: inputs.result_script != '' && steps.evaluate.outcome == 'success' && (!inputs.upload_artifacts || (inputs.artifact_lane == 'ripr-product' && steps.import_product.outputs.product_success == 'true') || (inputs.artifact_lane != 'ripr-product' && steps.import_receipts.outcome == 'success' && (inputs.artifact_lane != 'perl-rust-small' || (steps.perl_import_custody.outcome == 'success' && steps.perl_import_semantics.outcome == 'success'))))
         env:
